@@ -7,7 +7,7 @@ Daylight is a personal schedule and lesson planning workspace. It is designed to
 The first implementation is a responsive dashboard prototype with:
 
 - Daily schedule blocks for lessons, personal time, and recovery.
-- Daily energy and weekly load summaries.
+- Weekly teaching-hour and stamina summaries.
 - Current-month completed earnings with no synthetic starting balance.
 - Week and month calendar views with range navigation.
 - One-time and weekly recurring event creation with optional end dates.
@@ -15,7 +15,7 @@ The first implementation is a responsive dashboard prototype with:
 - Safe calculator parsing for numbers, decimals, parentheses, addition, subtraction, multiplication, and division.
 - Add and edit schedule blocks with time validation, intensity, preparation, and travel inputs.
 - Delete schedule blocks and keep changes in browser localStorage between visits.
-- Live energy and weekly load summaries based on the current schedule.
+- Live weekly teaching-hour summaries based on the current schedule.
 - Supabase SSR authentication and cloud lesson persistence when environment variables are configured.
 - A mobile navigation layout and desktop sidebar.
 
@@ -60,6 +60,23 @@ npm run build
 ```
 
 The calendar uses the profile timezone for display, expands weekly events only within the visible range, and keeps the event series separate from occurrence exceptions. Scheduled events do not count toward actual earnings; completed lesson events use hourly duration multiplied by rate, while skipped and cancelled events are excluded.
+
+## Deploy to GitHub Pages
+
+This repository includes a GitHub Actions workflow at `.github/workflows/deploy-pages.yml`. It builds the Next.js app as a static export and deploys the `out` directory to:
+
+`https://jerryleung16.github.io/schedule-management/`
+
+In the repository settings, set **Pages > Build and deployment > Source** to **GitHub Actions**. The workflow runs on pushes to `master`.
+
+For cloud persistence and authentication, add these repository variables under **Settings > Secrets and variables > Actions > Variables**:
+
+```env
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
+```
+
+GitHub Pages is a static host, so the server-side Supabase proxy is not available there. The dashboard and calendar retain their client-side authentication checks and use the public Supabase publishable key. Add the Pages URL under Supabase Authentication > URL Configuration.
 
 ## Planned product direction
 
