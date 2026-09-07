@@ -110,7 +110,8 @@ export default function CalendarPage() {
   const browserTimezone = useSyncExternalStore(subscribeToBrowser, getBrowserTimezone, getInitialTimezone);
   const timezone = profileTimezone ?? browserTimezone;
   const hydrated = todayKey !== initialDateKey;
-  const activeAnchorDate = anchorDate.getTime() === dateFromKey(initialDateKey).getTime() ? dateFromKey(todayKey) : anchorDate;
+  const activeAnchorKey = anchorDate.getTime() === dateFromKey(initialDateKey).getTime() ? todayKey : dateKey(anchorDate);
+  const activeAnchorDate = dateFromKey(activeAnchorKey);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -175,7 +176,7 @@ export default function CalendarPage() {
     };
     void load();
     return () => { cancelled = true; };
-  }, [activeAnchorDate, hydrated, rangeEndMs, router, view]);
+  }, [activeAnchorKey, hydrated, rangeEndMs, router, view]);
 
   const shiftRange = (amount: number) => {
     setAnchorDate(view === "month" ? new Date(activeAnchorDate.getFullYear(), activeAnchorDate.getMonth() + amount, 1, 12) : addDays(activeAnchorDate, amount * 7));
