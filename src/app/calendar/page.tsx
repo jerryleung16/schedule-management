@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { CalendarDays, ChevronLeft, ChevronRight, Clock3, Plus, Sparkles, X } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
@@ -29,9 +29,14 @@ type EventForm = {
 };
 
 const weekdayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const defaultDate = dateKey(new Date());
+const initialDateKey = "2000-01-01";
+const subscribeToBrowser = () => () => {};
+const getBrowserDateKey = () => dateKey(new Date());
+const getBrowserTimezone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
+const getInitialDateKey = () => initialDateKey;
+const getInitialTimezone = () => "Local time";
 
-function emptyForm(date = defaultDate): EventForm {
+function emptyForm(date = initialDateKey): EventForm {
   const weekday = dateFromKey(date).getDay();
   return {
     title: "",
@@ -96,11 +101,16 @@ function eventStyle(occurrence: ScheduleOccurrence, lane: number, laneCount: num
 export default function CalendarPage() {
   const router = useRouter();
   const [view, setView] = useState<CalendarView>("week");
-  const [anchorDate, setAnchorDate] = useState(dateFromKey(defaultDate));
+  const todayKey = useSyncExternalStore(subscribeToBrowser, getBrowserDateKey, getInitialDateKey);
+  const [anchorDate, setAnchorDate] = useState(dateFromKey(initialDateKey));
   const [events, setEvents] = useState<ScheduleEvent[]>([]);
   const [exceptions, setExceptions] = useState<ScheduleEventException[]>([]);
   const [userId, setUserId] = useState("");
-  const [timezone, setTimezone] = useState(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  const [profileTimezone, setProfileTimezone] = useState<string | null>(null);
+  const browserTimezone = useSyncExternalStore(subscribeToBrowser, getBrowserTimezone, getInitialTimezone);
+  const timezone = profileTimezone ?? browserTimezone;
+  const hydrated = todayKey !== initialDateKey;
+  const activeAnchorDate = anchorDate.getTime() === dateFromKey(initialDateKey).getTime() ? dateFromKey(todayKey) : anchorDate;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -110,15 +120,16 @@ export default function CalendarPage() {
   const [deleteScopeOpen, setDeleteScopeOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
-  const range = rangeForView(anchorDate, view);
+  const range = rangeForView(activeAnchorDate, view);
   const rangeEndMs = range.end.getTime();
   const occurrences = expandEvents(events, exceptions, range);
-  const suggestionRange = rangeForView(anchorDate, "week");
+  const suggestionRange = rangeForView(activeAnchorDate, "week");
   const suggestionOccurrences = expandEvents(events, exceptions, suggestionRange);
   const lessonSuggestions = suggestLessonSlots(suggestionRange, suggestionOccurrences);
   const days = Array.from({ length: view === "week" ? 7 : Math.round((range.end.getTime() - range.start.getTime()) / 86400000) }, (_, index) => addDays(range.start, index));
 
   useEffect(() => {
+    if (!hydrated) return;
     let cancelled = false;
     const load = async () => {
       setLoading(true);
@@ -132,7 +143,7 @@ export default function CalendarPage() {
       }
       setUserId(authData.user.id);
       const { data: profile } = await supabase.from("profiles").select("timezone").eq("id", authData.user.id).maybeSingle();
-      if (!cancelled && profile?.timezone) setTimezone(profile.timezone);
+      if (!cancelled && profile?.timezone) setProfileTimezone(profile.timezone);
 
       const { data, error: eventError } = await supabase
         .from("schedule_events")
@@ -164,13 +175,13 @@ export default function CalendarPage() {
     };
     void load();
     return () => { cancelled = true; };
-  }, [anchorDate, rangeEndMs, router, view]);
+  }, [activeAnchorDate, hydrated, rangeEndMs, router, view]);
 
   const shiftRange = (amount: number) => {
-    setAnchorDate((current) => view === "month" ? new Date(current.getFullYear(), current.getMonth() + amount, 1, 12) : addDays(current, amount * 7));
+    setAnchorDate(view === "month" ? new Date(activeAnchorDate.getFullYear(), activeAnchorDate.getMonth() + amount, 1, 12) : addDays(activeAnchorDate, amount * 7));
   };
 
-  const openEditor = (date = dateKey(anchorDate)) => {
+  const openEditor = (date = dateKey(activeAnchorDate)) => {
     setForm(emptyForm(date));
     setNotice("");
     setEditorOpen(true);
@@ -300,10 +311,10 @@ export default function CalendarPage() {
         {error && <div className="data-error" role="alert">{error}</div>}
         <section className="calendar-panel">
           <div className="calendar-toolbar">
-            <div className="calendar-toolbar-left"><button className="round-button" aria-label="Previous range" onClick={() => shiftRange(-1)}><ChevronLeft size={17} /></button><button className="round-button" aria-label="Next range" onClick={() => shiftRange(1)}><ChevronRight size={17} /></button><button className="today-button" onClick={() => setAnchorDate(dateFromKey(defaultDate))}>Today</button><strong>{formatRangeLabel(anchorDate, view)}</strong></div>
+            <div className="calendar-toolbar-left"><button className="round-button" aria-label="Previous range" onClick={() => shiftRange(-1)}><ChevronLeft size={17} /></button><button className="round-button" aria-label="Next range" onClick={() => shiftRange(1)}><ChevronRight size={17} /></button><button className="today-button" onClick={() => setAnchorDate(dateFromKey(todayKey))}>Today</button><strong>{formatRangeLabel(activeAnchorDate, view)}</strong></div>
             <div className="view-toggle"><button className={view === "week" ? "view-active" : ""} onClick={() => setView("week")}>Week</button><button className={view === "month" ? "view-active" : ""} onClick={() => setView("month")}>Month</button></div>
           </div>
-          {loading ? <div className="calendar-empty">Loading your calendar...</div> : view === "week" ? <div className="week-calendar"><div className="week-gutter" /><div className="week-day-heads">{days.map((day) => <div className="calendar-day-head" key={dateKey(day)}><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === defaultDate ? "day-today" : ""}>{day.getDate()}</strong></div>)}</div><div className="week-times"><span>07:00</span><span>10:00</span><span>13:00</span><span>16:00</span><span>19:00</span><span>22:00</span></div><div className="week-grid">{days.map((day) => { const dayEvents = occurrencesForDay(day); return <div className="week-day-column" key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="calendar-hour-lines" />{dayEvents.map((item, index) => <button className={`calendar-event event-${item.tone}`} key={item.occurrenceKey} style={eventStyle(item, index, Math.max(1, dayEvents.length))} onClick={() => { setSelectedOccurrence(item); setNotice(""); setDeleteScopeOpen(true); }}><strong>{item.title}</strong><span>{formatTime(item.startsAt)} · {item.kind === "lesson" ? `$${item.fixedFee ?? item.hourlyRate}/h` : "Personal"}</span></button>)}</div>; })}</div></div> : <div className="month-calendar">{days.map((day) => { const dayEvents = occurrencesForDay(day); const outside = day.getMonth() !== anchorDate.getMonth(); return <div className={`month-day ${outside ? "month-day-outside" : ""}`} key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="month-day-number"><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === defaultDate ? "day-today" : ""}>{day.getDate()}</strong></div>{dayEvents.slice(0, 4).map((item) => <button className={`month-event event-${item.tone}`} key={item.occurrenceKey} onClick={() => { setSelectedOccurrence(item); setNotice(""); setDeleteScopeOpen(true); }}>{formatTime(item.startsAt)} {item.title}</button>)}{dayEvents.length > 4 && <span className="more-events">+{dayEvents.length - 4} more</span>}</div>; })}</div>}
+          {loading ? <div className="calendar-empty">Loading your calendar...</div> : view === "week" ? <div className="week-calendar"><div className="week-gutter" /><div className="week-day-heads">{days.map((day) => <div className="calendar-day-head" key={dateKey(day)}><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>)}</div><div className="week-times"><span>07:00</span><span>10:00</span><span>13:00</span><span>16:00</span><span>19:00</span><span>22:00</span></div><div className="week-grid">{days.map((day) => { const dayEvents = occurrencesForDay(day); return <div className="week-day-column" key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="calendar-hour-lines" />{dayEvents.map((item, index) => <button className={`calendar-event event-${item.tone}`} key={item.occurrenceKey} style={eventStyle(item, index, Math.max(1, dayEvents.length))} onClick={() => { setSelectedOccurrence(item); setNotice(""); setDeleteScopeOpen(true); }}><strong>{item.title}</strong><span>{formatTime(item.startsAt)} · {item.kind === "lesson" ? `$${item.fixedFee ?? item.hourlyRate}/h` : "Personal"}</span></button>)}</div>; })}</div></div> : <div className="month-calendar">{days.map((day) => { const dayEvents = occurrencesForDay(day); const outside = day.getMonth() !== activeAnchorDate.getMonth(); return <div className={`month-day ${outside ? "month-day-outside" : ""}`} key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="month-day-number"><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>{dayEvents.slice(0, 4).map((item) => <button className={`month-event event-${item.tone}`} key={item.occurrenceKey} onClick={() => { setSelectedOccurrence(item); setNotice(""); setDeleteScopeOpen(true); }}>{formatTime(item.startsAt)} {item.title}</button>)}{dayEvents.length > 4 && <span className="more-events">+{dayEvents.length - 4} more</span>}</div>; })}</div>}
         </section>
         <p className="calendar-footnote"><Clock3 size={14} /> {timezone} · Double-click a day to add an event.</p>
       </div>
