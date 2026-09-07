@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { CalendarDays, ChevronLeft, ChevronRight, Clock3, Plus, Sparkles, X } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
-import { slotConflicts, suggestLessonSlots } from "@/lib/schedule/availability";
+import { slotConflicts } from "@/lib/schedule/availability";
 import { addDays, dateKey, dateFromKey, formatRangeLabel, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
 import type { CalendarView, DeleteScope, EventKind, EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence } from "@/lib/schedule/types";
@@ -17,11 +17,8 @@ type EventForm = {
   ends: string;
   kind: EventKind;
   tone: EventTone;
-  intensity: number;
-  prepMinutes: number;
   travelMinutes: number;
   hourlyRate: number;
-  fixedFee: string;
   status: EventStatus;
   recurring: boolean;
   weekdays: number[];
@@ -35,6 +32,17 @@ const getBrowserDateKey = () => dateKey(new Date());
 const getBrowserTimezone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
 const getInitialDateKey = () => initialDateKey;
 const getInitialTimezone = () => "Local time";
+const CALENDAR_START_MINUTES = 7 * 60;
+const CALENDAR_END_MINUTES = 22 * 60;
+const CALENDAR_INTERVAL_MINUTES = 30;
+const CALENDAR_DURATION_MINUTES = CALENDAR_END_MINUTES - CALENDAR_START_MINUTES;
+const calendarTimeLabels = Array.from(
+  { length: (CALENDAR_DURATION_MINUTES / CALENDAR_INTERVAL_MINUTES) + 1 },
+  (_, index) => {
+    const totalMinutes = CALENDAR_START_MINUTES + index * CALENDAR_INTERVAL_MINUTES;
+    return `${String(Math.floor(totalMinutes / 60)).padStart(2, "0")}:${String(totalMinutes % 60).padStart(2, "0")}`;
+  },
+);
 
 function emptyForm(date = initialDateKey): EventForm {
   const weekday = dateFromKey(date).getDay();
@@ -46,11 +54,8 @@ function emptyForm(date = initialDateKey): EventForm {
     ends: "11:00",
     kind: "lesson",
     tone: "coral",
-    intensity: 2,
-    prepMinutes: 15,
     travelMinutes: 0,
     hourlyRate: 35,
-    fixedFee: "",
     status: "scheduled",
     recurring: false,
     weekdays: [weekday],
@@ -93,8 +98,8 @@ function eventStyle(occurrence: ScheduleOccurrence, lane: number, laneCount: num
   const end = new Date(occurrence.endsAt);
   const startMinutes = start.getHours() * 60 + start.getMinutes();
   const duration = Math.max(30, (end.getTime() - start.getTime()) / 60000);
-  const top = Math.max(0, ((startMinutes - 420) / 900) * 100);
-  const height = Math.max(4.5, (duration / 900) * 100);
+  const top = Math.max(0, ((startMinutes - CALENDAR_START_MINUTES) / CALENDAR_DURATION_MINUTES) * 100);
+  const height = Math.max(4.5, (duration / CALENDAR_DURATION_MINUTES) * 100);
   return { top: `${top}%`, height: `${height}%`, left: `calc(${(lane / laneCount) * 100}% + 6px)`, width: `calc(${(100 / laneCount)}% - 12px)` };
 }
 
@@ -118,16 +123,15 @@ export default function CalendarPage() {
   const [editorOpen, setEditorOpen] = useState(false);
   const [form, setForm] = useState<EventForm>(emptyForm());
   const [selectedOccurrence, setSelectedOccurrence] = useState<ScheduleOccurrence | null>(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deleteScopeOpen, setDeleteScopeOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
   const range = rangeForView(activeAnchorDate, view);
   const rangeEndMs = range.end.getTime();
   const occurrences = expandEvents(events, exceptions, range);
-  const suggestionRange = rangeForView(activeAnchorDate, "week");
-  const suggestionOccurrences = expandEvents(events, exceptions, suggestionRange);
-  const lessonSuggestions = suggestLessonSlots(suggestionRange, suggestionOccurrences);
-  const days = Array.from({ length: view === "week" ? 7 : Math.round((range.end.getTime() - range.start.getTime()) / 86400000) }, (_, index) => addDays(range.start, index));
+  const days = Array.from({ length: view === "day" ? 1 : view === "week" ? 7 : Math.round((range.end.getTime() - range.start.getTime()) / 86400000) }, (_, index) => addDays(range.start, index));
 
   useEffect(() => {
     if (!hydrated) return;
@@ -179,7 +183,9 @@ export default function CalendarPage() {
   }, [activeAnchorKey, hydrated, rangeEndMs, router, view]);
 
   const shiftRange = (amount: number) => {
-    setAnchorDate(view === "month" ? new Date(activeAnchorDate.getFullYear(), activeAnchorDate.getMonth() + amount, 1, 12) : addDays(activeAnchorDate, amount * 7));
+    setAnchorDate(view === "month"
+      ? new Date(activeAnchorDate.getFullYear(), activeAnchorDate.getMonth() + amount, 1, 12)
+      : addDays(activeAnchorDate, view === "day" ? amount : amount * 7));
   };
 
   const openEditor = (date = dateKey(activeAnchorDate)) => {
@@ -215,11 +221,11 @@ export default function CalendarPage() {
       detail: form.detail.trim(),
       kind: form.kind,
       tone: form.tone,
-      intensity: form.intensity,
-      prep_minutes: form.prepMinutes,
       travel_minutes: form.travelMinutes,
       hourly_rate: form.hourlyRate,
-      fixed_fee: form.fixedFee ? Number(form.fixedFee) : null,
+      intensity: 2,
+      prep_minutes: 0,
+      fixed_fee: null,
       status: form.status,
       recurrence_weekdays: form.recurring ? form.weekdays : [],
       recurrence_until: form.recurring && form.recurrenceUntil ? form.recurrenceUntil : null,
@@ -240,8 +246,8 @@ export default function CalendarPage() {
         detail: payload.detail,
         kind: payload.kind,
         tone: payload.tone,
-        intensity: payload.intensity,
-        prep_minutes: payload.prep_minutes,
+        intensity: 2,
+        prep_minutes: 0,
         travel_minutes: payload.travel_minutes,
         hourly_rate: payload.hourly_rate,
         status: payload.status === "completed" ? "completed" : "scheduled",
@@ -264,6 +270,23 @@ export default function CalendarPage() {
   };
 
   const occurrencesForDay = (day: Date) => occurrences.filter((item) => occurrenceDay(item) === dateKey(day));
+
+  const openOccurrenceDetails = (occurrence: ScheduleOccurrence) => {
+    setSelectedOccurrence(occurrence);
+    setNotice("");
+    setDetailsOpen(true);
+  };
+
+  const requestDelete = () => {
+    if (!selectedOccurrence) return;
+    setDetailsOpen(false);
+    setDeleteConfirmOpen(true);
+  };
+
+  const continueDelete = () => {
+    setDeleteConfirmOpen(false);
+    setDeleteScopeOpen(true);
+  };
 
   const deleteSelectedOccurrence = async (scope: DeleteScope) => {
     if (!selectedOccurrence) return;
@@ -291,6 +314,8 @@ export default function CalendarPage() {
       return;
     }
     setDeleteScopeOpen(false);
+    setDeleteConfirmOpen(false);
+    setDetailsOpen(false);
     setSelectedOccurrence(null);
     setNotice(scope === "occurrence" ? "This occurrence was removed." : scope === "following" ? "This and future occurrences were removed." : "The recurring event was deleted.");
     setAnchorDate((current) => new Date(current));
@@ -313,14 +338,16 @@ export default function CalendarPage() {
         <section className="calendar-panel">
           <div className="calendar-toolbar">
             <div className="calendar-toolbar-left"><button className="round-button" aria-label="Previous range" onClick={() => shiftRange(-1)}><ChevronLeft size={17} /></button><button className="round-button" aria-label="Next range" onClick={() => shiftRange(1)}><ChevronRight size={17} /></button><button className="today-button" onClick={() => setAnchorDate(dateFromKey(todayKey))}>Today</button><strong>{formatRangeLabel(activeAnchorDate, view)}</strong></div>
-            <div className="view-toggle"><button className={view === "week" ? "view-active" : ""} onClick={() => setView("week")}>Week</button><button className={view === "month" ? "view-active" : ""} onClick={() => setView("month")}>Month</button></div>
+            <div className="view-toggle"><button className={view === "day" ? "view-active" : ""} onClick={() => setView("day")}>Day</button><button className={view === "week" ? "view-active" : ""} onClick={() => setView("week")}>Week</button><button className={view === "month" ? "view-active" : ""} onClick={() => setView("month")}>Month</button></div>
           </div>
-          {loading ? <div className="calendar-empty">Loading your calendar...</div> : view === "week" ? <div className="week-calendar"><div className="week-gutter" /><div className="week-day-heads">{days.map((day) => <div className="calendar-day-head" key={dateKey(day)}><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>)}</div><div className="week-times"><span>07:00</span><span>10:00</span><span>13:00</span><span>16:00</span><span>19:00</span><span>22:00</span></div><div className="week-grid">{days.map((day) => { const dayEvents = occurrencesForDay(day); return <div className="week-day-column" key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="calendar-hour-lines" />{dayEvents.map((item, index) => <button className={`calendar-event event-${item.tone}`} key={item.occurrenceKey} style={eventStyle(item, index, Math.max(1, dayEvents.length))} onClick={() => { setSelectedOccurrence(item); setNotice(""); setDeleteScopeOpen(true); }}><strong>{item.title}</strong><span>{formatTime(item.startsAt)} · {item.kind === "lesson" ? `$${item.fixedFee ?? item.hourlyRate}/h` : "Personal"}</span></button>)}</div>; })}</div></div> : <div className="month-calendar">{days.map((day) => { const dayEvents = occurrencesForDay(day); const outside = day.getMonth() !== activeAnchorDate.getMonth(); return <div className={`month-day ${outside ? "month-day-outside" : ""}`} key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="month-day-number"><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>{dayEvents.slice(0, 4).map((item) => <button className={`month-event event-${item.tone}`} key={item.occurrenceKey} onClick={() => { setSelectedOccurrence(item); setNotice(""); setDeleteScopeOpen(true); }}>{formatTime(item.startsAt)} {item.title}</button>)}{dayEvents.length > 4 && <span className="more-events">+{dayEvents.length - 4} more</span>}</div>; })}</div>}
+          {loading ? <div className="calendar-empty">Loading your calendar...</div> : view === "day" || view === "week" ? <div className={`week-calendar ${view === "day" ? "day-calendar" : ""}`}><div className="week-gutter" /><div className="week-day-heads">{days.map((day) => <div className="calendar-day-head" key={dateKey(day)}><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>)}</div><div className="week-times">{calendarTimeLabels.map((label) => <span key={label}>{label}</span>)}</div><div className="week-grid">{days.map((day) => { const dayEvents = occurrencesForDay(day); return <div className="week-day-column" key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="calendar-hour-lines" />{dayEvents.map((item, index) => <button className={`calendar-event event-${item.tone}`} key={item.occurrenceKey} style={eventStyle(item, index, Math.max(1, dayEvents.length))} onClick={() => openOccurrenceDetails(item)}><strong>{item.title}</strong><span>{formatTime(item.startsAt)} · {item.kind === "lesson" ? `$${item.fixedFee ?? item.hourlyRate}/h` : "Personal"}</span></button>)}</div>; })}</div></div> : <div className="month-calendar">{days.map((day) => { const dayEvents = occurrencesForDay(day); const outside = day.getMonth() !== activeAnchorDate.getMonth(); return <div className={`month-day ${outside ? "month-day-outside" : ""}`} key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="month-day-number"><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>{dayEvents.slice(0, 4).map((item) => <button className={`month-event event-${item.tone}`} key={item.occurrenceKey} onClick={() => openOccurrenceDetails(item)}>{formatTime(item.startsAt)} {item.title}</button>)}{dayEvents.length > 4 && <span className="more-events">+{dayEvents.length - 4} more</span>}</div>; })}</div>}
         </section>
         <p className="calendar-footnote"><Clock3 size={14} /> {timezone} · Double-click a day to add an event.</p>
       </div>
-      {editorOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setEditorOpen(false); }}><section className="lesson-modal calendar-editor" role="dialog" aria-modal="true" aria-labelledby="event-modal-title"><div className="modal-heading"><div><p className="section-kicker">Calendar event</p><h2 id="event-modal-title">Add to your time</h2></div><button className="modal-close" aria-label="Close event form" onClick={() => setEditorOpen(false)}><X size={18} /></button></div><form onSubmit={saveEvent}><div className="form-grid"><label className="form-field form-field-wide"><span>Name</span><input autoFocus value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="e.g. Biology · Alex" /></label><label className="form-field form-field-wide"><span>Notes</span><input value={form.detail} onChange={(event) => setForm({ ...form, detail: event.target.value })} placeholder="What is this block for?" /></label><label className="form-field"><span>Date</span><input type="date" value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} /></label><label className="form-field"><span>Type</span><select value={form.kind} onChange={(event) => setForm({ ...form, kind: event.target.value as EventKind })}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label><label className="form-field"><span>Starts</span><input type="time" value={form.starts} onChange={(event) => setForm({ ...form, starts: event.target.value })} /></label><label className="form-field"><span>Ends</span><input type="time" value={form.ends} onChange={(event) => setForm({ ...form, ends: event.target.value })} /></label><label className="form-field"><span>Hourly rate</span><input type="number" min="0" step="0.5" value={form.hourlyRate} onChange={(event) => setForm({ ...form, hourlyRate: Number(event.target.value) })} /></label><label className="form-field"><span>Fixed fee</span><input type="number" min="0" step="0.5" value={form.fixedFee} onChange={(event) => setForm({ ...form, fixedFee: event.target.value })} placeholder="Optional" /></label><label className="form-field"><span>Repeat</span><select value={form.recurring ? "weekly" : "once"} onChange={(event) => setForm({ ...form, recurring: event.target.value === "weekly" })}><option value="once">One time</option><option value="weekly">Weekly</option></select></label>{form.recurring && <label className="form-field"><span>Repeat until</span><input type="date" min={form.date} value={form.recurrenceUntil} onChange={(event) => setForm({ ...form, recurrenceUntil: event.target.value })} /> </label>}{form.recurring && <div className="weekday-picker form-field-wide"><span className="form-field-label">Days</span><div>{weekdayLabels.map((label, index) => <button type="button" className={form.weekdays.includes(index) ? "weekday-active" : ""} key={label} onClick={() => setForm({ ...form, weekdays: form.weekdays.includes(index) ? form.weekdays.filter((day) => day !== index) : [...form.weekdays, index] })}>{label}</button>)}</div></div>}<label className="form-field"><span>Intensity</span><input type="number" min="0" max="10" step="0.5" value={form.intensity} onChange={(event) => setForm({ ...form, intensity: Number(event.target.value) })} /></label><label className="form-field"><span>Prep minutes</span><input type="number" min="0" value={form.prepMinutes} onChange={(event) => setForm({ ...form, prepMinutes: Number(event.target.value) })} /></label></div>{form.kind === "lesson" && <div className="suggested-slots"><span className="form-field-label">Suggested openings</span><div className="suggested-slot-list">{lessonSuggestions.map((slot) => <button type="button" className="suggested-slot" key={`${slot.date}-${slot.starts}-${slot.ends}`} onClick={() => { setForm({ ...form, date: slot.date, starts: slot.starts, ends: slot.ends }); setAnchorDate(dateFromKey(slot.date)); }}>{dateFromKey(slot.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })} · {slot.starts}–{slot.ends} · {slot.durationMinutes === 60 ? "1 hr" : "1.5 hrs"}</button>)}{lessonSuggestions.length === 0 && <p className="suggested-slot-empty">No open slots found this week.</p>}</div></div>}{error && <p className="form-error">{error}</p>}<div className="modal-footer"><span /><button type="button" className="secondary-button" onClick={() => setEditorOpen(false)}>Cancel</button><button type="submit" className="primary-button"><Plus size={15} /> Save event</button></div></form></section></div>}
-      {deleteScopeOpen && selectedOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !deleting) setDeleteScopeOpen(false); }}><section className="lesson-modal delete-scope-modal" role="dialog" aria-modal="true" aria-labelledby="delete-event-title"><div className="modal-heading"><div><p className="section-kicker">Remove event</p><h2 id="delete-event-title">{selectedOccurrence.title}</h2><p className="calendar-subtitle">{formatTime(selectedOccurrence.startsAt)} · {new Date(selectedOccurrence.startsAt).toLocaleDateString()}</p></div><button className="modal-close" aria-label="Close delete dialog" disabled={deleting} onClick={() => setDeleteScopeOpen(false)}><X size={18} /></button></div>{selectedOccurrence.isRecurring ? <div className="delete-scope-options"><button className="secondary-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("occurrence")}>This occurrence</button><button className="secondary-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("following")}>This and following</button><button className="primary-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("all")}>All events in series</button></div> : <div className="modal-footer"><span>Delete this event?</span><button className="secondary-button" disabled={deleting} onClick={() => setDeleteScopeOpen(false)}>Keep it</button><button className="primary-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("all")}>Delete event</button></div>}</section></div>}
+      {editorOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setEditorOpen(false); }}><section className="lesson-modal calendar-editor" role="dialog" aria-modal="true" aria-labelledby="event-modal-title"><div className="modal-heading"><div><p className="section-kicker">Calendar event</p><h2 id="event-modal-title">Add to your time</h2></div><button className="modal-close" aria-label="Close event form" onClick={() => setEditorOpen(false)}><X size={18} /></button></div><form onSubmit={saveEvent}><div className="form-grid"><label className="form-field form-field-wide"><span>Name</span><input autoFocus value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="e.g. Biology · Alex" /></label><label className="form-field form-field-wide"><span>Notes</span><input value={form.detail} onChange={(event) => setForm({ ...form, detail: event.target.value })} placeholder="What is this block for?" /></label><label className="form-field"><span>Date</span><input type="date" value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} /></label><label className="form-field"><span>Type</span><select value={form.kind} onChange={(event) => setForm({ ...form, kind: event.target.value as EventKind })}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label><label className="form-field"><span>Starts</span><input type="time" value={form.starts} onChange={(event) => setForm({ ...form, starts: event.target.value })} /></label><label className="form-field"><span>Ends</span><input type="time" value={form.ends} onChange={(event) => setForm({ ...form, ends: event.target.value })} /></label><label className="form-field"><span>Hourly rate</span><input type="number" min="0" step="0.5" value={form.hourlyRate} onChange={(event) => setForm({ ...form, hourlyRate: Number(event.target.value) })} /></label><label className="form-field"><span>Travel minutes</span><input type="number" min="0" value={form.travelMinutes} onChange={(event) => setForm({ ...form, travelMinutes: Number(event.target.value) })} /></label><label className="form-field"><span>Repeat</span><select value={form.recurring ? "weekly" : "once"} onChange={(event) => setForm({ ...form, recurring: event.target.value === "weekly" })}><option value="once">One time</option><option value="weekly">Weekly</option></select></label>{form.recurring && <label className="form-field"><span>Repeat until</span><input type="date" min={form.date} value={form.recurrenceUntil} onChange={(event) => setForm({ ...form, recurrenceUntil: event.target.value })} /> </label>}{form.recurring && <div className="weekday-picker form-field-wide"><span className="form-field-label">Days</span><div>{weekdayLabels.map((label, index) => <button type="button" className={form.weekdays.includes(index) ? "weekday-active" : ""} key={label} onClick={() => setForm({ ...form, weekdays: form.weekdays.includes(index) ? form.weekdays.filter((day) => day !== index) : [...form.weekdays, index] })}>{label}</button>)}</div></div>}</div>{error && <p className="form-error">{error}</p>}<div className="modal-footer"><span /><button type="button" className="secondary-button" onClick={() => setEditorOpen(false)}>Cancel</button><button type="submit" className="primary-button"><Plus size={15} /> Save event</button></div></form></section></div>}
+      {detailsOpen && selectedOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setDetailsOpen(false); }}><section className="lesson-modal event-details-modal" role="dialog" aria-modal="true" aria-labelledby="event-details-title"><div className="modal-heading"><div><p className="section-kicker">Event details</p><h2 id="event-details-title">{selectedOccurrence.title}</h2><p className="calendar-subtitle">{new Date(selectedOccurrence.startsAt).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p></div><button className="modal-close" aria-label="Close event details" onClick={() => setDetailsOpen(false)}><X size={18} /></button></div><div className="event-detail-grid"><div><span>Time</span><strong>{formatTime(selectedOccurrence.startsAt)}–{formatTime(selectedOccurrence.endsAt)}</strong></div><div><span>Type</span><strong>{selectedOccurrence.kind === "lesson" ? "Lesson" : "Personal"}</strong></div><div><span>Rate</span><strong>{selectedOccurrence.kind === "lesson" ? `$${selectedOccurrence.fixedFee ?? selectedOccurrence.hourlyRate}/h` : "Not applicable"}</strong></div><div><span>Travel</span><strong>{selectedOccurrence.travelMinutes} minutes</strong></div><div><span>Status</span><strong>{selectedOccurrence.status}</strong></div><div><span>Repeat</span><strong>{selectedOccurrence.isRecurring ? "Weekly series" : "One time"}</strong></div>{selectedOccurrence.detail && <div className="event-detail-wide"><span>Notes</span><strong>{selectedOccurrence.detail}</strong></div>}</div><div className="modal-footer"><button type="button" className="delete-button" onClick={requestDelete}>Delete event</button><span /><button type="button" className="secondary-button" onClick={() => setDetailsOpen(false)}>Close</button></div></section></div>}
+      {deleteConfirmOpen && selectedOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !deleting) setDeleteConfirmOpen(false); }}><section className="lesson-modal delete-scope-modal" role="dialog" aria-modal="true" aria-labelledby="delete-warning-title"><div className="modal-heading"><div><p className="section-kicker">Remove event</p><h2 id="delete-warning-title">Delete {selectedOccurrence.title}?</h2></div><button className="modal-close" aria-label="Close delete warning" disabled={deleting} onClick={() => setDeleteConfirmOpen(false)}><X size={18} /></button></div><div className="delete-warning"><strong>This cannot be undone.</strong><p>{selectedOccurrence.isRecurring ? "The next step will let you choose whether to remove this occurrence, this and following occurrences, or the entire series." : "This event will be permanently removed from your calendar."}</p></div><div className="modal-footer"><button type="button" className="secondary-button" disabled={deleting} onClick={() => setDeleteConfirmOpen(false)}>Keep event</button><span />{selectedOccurrence.isRecurring ? <button type="button" className="delete-button" disabled={deleting} onClick={continueDelete}>Choose deletion scope</button> : <button type="button" className="delete-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("all")}>Delete event</button>}</div></section></div>}
+      {deleteScopeOpen && selectedOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !deleting) setDeleteScopeOpen(false); }}><section className="lesson-modal delete-scope-modal" role="dialog" aria-modal="true" aria-labelledby="delete-event-title"><div className="modal-heading"><div><p className="section-kicker">Choose deletion scope</p><h2 id="delete-event-title">{selectedOccurrence.title}</h2><p className="calendar-subtitle">{formatTime(selectedOccurrence.startsAt)} · {new Date(selectedOccurrence.startsAt).toLocaleDateString()}</p></div><button className="modal-close" aria-label="Close deletion scope" disabled={deleting} onClick={() => setDeleteScopeOpen(false)}><X size={18} /></button></div><div className="delete-scope-options"><button className="secondary-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("occurrence")}>This occurrence</button><button className="secondary-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("following")}>This and following</button><button className="delete-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("all")}>All events in series</button></div></section></div>}
     </main>
   );
 }

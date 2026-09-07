@@ -12,6 +12,7 @@ import {
   CircleHelp,
   Clock3,
   Command,
+  Copy,
   LayoutDashboard,
   LogOut,
   Menu,
@@ -19,16 +20,15 @@ import {
   Save,
   Settings2,
   Sparkles,
-  Trash2,
   UserRound,
   UsersRound,
   X,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
-import { lessonHours, slotConflicts, staminaState, suggestLessonSlots } from "@/lib/schedule/availability";
+import { formatWeeklyAvailabilityMessage, lessonHours, normalizeWeeklyAvailability, slotConflicts, staminaState, validateWeeklyAvailability } from "@/lib/schedule/availability";
 import { addDays, dateFromKey, dateKey, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
-import type { EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence } from "@/lib/schedule/types";
+import type { EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, WeeklyAvailability } from "@/lib/schedule/types";
 
 type IconComponent = typeof LayoutDashboard;
 
@@ -48,6 +48,7 @@ type Lesson = {
 };
 
 const storageKey = "daylight-lessons";
+const availabilityStorageKey = "daylight-weekly-availability";
 const scheduleDate = new Date().toISOString().slice(0, 10);
 const supabaseConfigured = Boolean(
   process.env.NEXT_PUBLIC_SUPABASE_URL &&
@@ -288,7 +289,13 @@ export default function Home() {
   const [editingLesson, setEditingLesson] = useState<Lesson | null>(null);
   const [lessonFormDate, setLessonFormDate] = useState(selectedDate);
   const [lessonModalOpen, setLessonModalOpen] = useState(false);
+  const [lessonDetailsOpen, setLessonDetailsOpen] = useState(false);
+  const [lessonDeleteConfirmOpen, setLessonDeleteConfirmOpen] = useState(false);
   const [lessonFormError, setLessonFormError] = useState("");
+  const [availability, setAvailability] = useState<WeeklyAvailability[]>([]);
+  const [availabilityMessage, setAvailabilityMessage] = useState("");
+  const [availabilityError, setAvailabilityError] = useState("");
+  const [availabilitySaving, setAvailabilitySaving] = useState(false);
   const [calculatorValue, setCalculatorValue] = useState("128 / 4");
   const [calculatorResult, setCalculatorResult] = useState("32");
   const [calculatorError, setCalculatorError] = useState("");
@@ -414,6 +421,38 @@ export default function Home() {
   }, [selectedDate]);
 
   useEffect(() => {
+    if (supabaseConfigured && !userId) return;
+    let cancelled = false;
+    const loadAvailability = async () => {
+      let loaded: WeeklyAvailability[] = [];
+      if (!supabaseConfigured) {
+        const stored = window.localStorage.getItem(availabilityStorageKey);
+        if (stored) {
+          try { loaded = JSON.parse(stored) as WeeklyAvailability[]; } catch { window.localStorage.removeItem(availabilityStorageKey); }
+        }
+      } else {
+        const { data, error } = await createClient().from("weekly_availability").select("id, weekday, starts, ends").eq("user_id", userId).order("weekday").order("starts");
+        if (error) {
+          const stored = window.localStorage.getItem(availabilityStorageKey);
+          if (stored) {
+            try { loaded = JSON.parse(stored) as WeeklyAvailability[]; } catch { window.localStorage.removeItem(availabilityStorageKey); }
+          }
+          if (!cancelled) setAvailabilityError("Cloud availability is not ready yet; local availability is being used.");
+        } else {
+          loaded = (data ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), starts: String(row.starts).slice(0, 5), ends: String(row.ends).slice(0, 5) }));
+        }
+      }
+      if (!cancelled) {
+        const normalized = normalizeWeeklyAvailability(loaded);
+        setAvailability(normalized);
+        setAvailabilityMessage(formatWeeklyAvailabilityMessage(normalized, Intl.DateTimeFormat().resolvedOptions().timeZone));
+      }
+    };
+    void loadAvailability();
+    return () => { cancelled = true; };
+  }, [userId]);
+
+  useEffect(() => {
     if (hasLoadedLessons.current && !supabaseConfigured) {
       window.localStorage.setItem(`${storageKey}-${selectedDate}`, JSON.stringify(lessons));
     }
@@ -421,6 +460,65 @@ export default function Home() {
 
   const showNotice = (message: string) => {
     setNotice(message);
+  };
+
+  const updateAvailability = (next: WeeklyAvailability[]) => {
+    const normalized = normalizeWeeklyAvailability(next);
+    setAvailability(normalized);
+    setAvailabilityMessage(formatWeeklyAvailabilityMessage(normalized, Intl.DateTimeFormat().resolvedOptions().timeZone));
+    setAvailabilityError(validateWeeklyAvailability(normalized));
+  };
+
+  const addAvailabilityWindow = (weekday: number) => {
+    updateAvailability([...availability, { weekday, starts: "10:00", ends: "11:00" }]);
+  };
+
+  const removeAvailabilityWindow = (index: number) => {
+    updateAvailability(availability.filter((_, itemIndex) => itemIndex !== index));
+  };
+
+  const saveAvailability = async () => {
+    const validationError = validateWeeklyAvailability(availability);
+    if (validationError) {
+      setAvailabilityError(validationError);
+      return;
+    }
+    setAvailabilitySaving(true);
+    setAvailabilityError("");
+    if (!supabaseConfigured) {
+      window.localStorage.setItem(availabilityStorageKey, JSON.stringify(availability));
+      setAvailabilitySaving(false);
+      showNotice("Weekly availability saved in this browser.");
+      return;
+    }
+    if (!userId) {
+      setAvailabilitySaving(false);
+      setAvailabilityError("Your session is still loading. Try again in a moment.");
+      return;
+    }
+    const supabase = createClient();
+    const { error: deleteError } = await supabase.from("weekly_availability").delete().eq("user_id", userId);
+    const { error: insertError } = deleteError
+      ? { error: deleteError }
+      : availability.length
+        ? await supabase.from("weekly_availability").insert(availability.map((interval) => ({ user_id: userId, weekday: interval.weekday, starts: interval.starts, ends: interval.ends })))
+        : { error: null };
+    setAvailabilitySaving(false);
+    if (insertError) {
+      window.localStorage.setItem(availabilityStorageKey, JSON.stringify(availability));
+      setAvailabilityError("Cloud availability is not ready yet; your changes are saved in this browser.");
+      return;
+    }
+    showNotice("Weekly availability saved to the cloud.");
+  };
+
+  const copyAvailabilityMessage = async () => {
+    try {
+      await navigator.clipboard.writeText(availabilityMessage);
+      showNotice("Availability message copied.");
+    } catch {
+      setAvailabilityError("Clipboard access was unavailable. Select the message and copy it manually.");
+    }
   };
 
   const focusSection = (label: string, section: HTMLElement | null) => {
@@ -509,11 +607,23 @@ export default function Home() {
     setLessonModalOpen(true);
   };
 
-  const openLesson = (lesson: Lesson) => {
+  const openLessonEditor = (lesson: Lesson) => {
     setLessonFormDate(selectedDate);
     setEditingLesson({ ...lesson });
     setLessonFormError("");
     setLessonModalOpen(true);
+  };
+
+  const openLesson = (lesson: Lesson) => {
+    setLessonFormDate(selectedDate);
+    setEditingLesson({ ...lesson });
+    setLessonFormError("");
+    setLessonDetailsOpen(true);
+  };
+
+  const requestLessonDelete = () => {
+    setLessonDetailsOpen(false);
+    setLessonDeleteConfirmOpen(true);
   };
 
   const saveLesson = async (event: FormEvent<HTMLFormElement>) => {
@@ -563,7 +673,11 @@ export default function Home() {
     if (!editingLesson) return;
     if (supabaseConfigured) {
       setIsCloudSaving(true);
-      const { error } = await createClient().from("lessons").delete().eq("id", editingLesson.id);
+      const supabase = createClient();
+      const canonical = await supabase.from("schedule_events").delete().eq("id", editingLesson.id);
+      const error = canonical.error
+        ? (await supabase.from("lessons").delete().eq("id", editingLesson.id)).error
+        : null;
       setIsCloudSaving(false);
       if (error) {
         setLessonFormError(error.message);
@@ -572,6 +686,8 @@ export default function Home() {
     }
     setLessons((current) => current.filter((lesson) => lesson.id !== editingLesson.id));
     setLessonModalOpen(false);
+    setLessonDetailsOpen(false);
+    setLessonDeleteConfirmOpen(false);
     setEditingLesson(null);
   };
 
@@ -585,8 +701,6 @@ export default function Home() {
   const displayedWeeklyLessonHours = supabaseConfigured ? weeklyLessonHours : localLessonHours;
   const weeklyStamina = staminaState(displayedWeeklyLessonHours);
   const weeklyStaminaMeter = Math.min(100, Math.round((displayedWeeklyLessonHours / 25) * 100));
-  const dashboardWeekRange = rangeForView(dateFromKey(selectedDate), "week");
-  const lessonSuggestions = suggestLessonSlots(dashboardWeekRange, weeklyOccurrences);
   const completedLessons = lessons.filter((lesson) => lesson.kind === "lesson" && lesson.status === "completed");
   const currentEarnings = supabaseConfigured ? monthlyCompletedEarnings : completedLessons.reduce((total, lesson) => total + ((minutesFromTime(lesson.end) - minutesFromTime(lesson.time)) / 60) * lesson.rate, 0);
   const displayedCompletedCount = supabaseConfigured ? monthlyCompletedCount : completedLessons.length;
@@ -694,9 +808,34 @@ export default function Home() {
             </section>
 
           </div>
+          <section className="panel availability-panel" aria-labelledby="availability-title">
+            <div className="panel-heading"><div><p className="section-kicker">Client-ready rhythm</p><h2 id="availability-title">Weekly availability</h2></div><Clock3 size={20} className="panel-icon" /></div>
+            <div className="availability-content">
+              <p className="availability-intro">Keep your recurring teaching windows here, then send the pattern when a client asks what works.</p>
+              <div className="availability-days">{[1, 2, 3, 4, 5, 6, 0].map((weekday) => <div className="availability-day" key={weekday}><div className="availability-day-heading"><strong>{["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][weekday]}</strong><button type="button" className="text-button" onClick={() => addAvailabilityWindow(weekday)}><Plus size={13} /> Add window</button></div>{availability.map((interval, index) => interval.weekday === weekday && <div className="availability-window" key={`${interval.weekday}-${index}`}><input aria-label={`${["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][weekday]} start`} type="time" value={interval.starts} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, starts: event.target.value } : item))} /><span>to</span><input aria-label={`${["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][weekday]} end`} type="time" value={interval.ends} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, ends: event.target.value } : item))} /><button type="button" className="icon-button availability-remove" aria-label="Remove availability window" onClick={() => removeAvailabilityWindow(index)}><X size={14} /></button></div>)}</div>)}</div>
+              {availabilityError && <p className="form-error" role="alert">{availabilityError}</p>}
+              <div className="availability-actions"><button type="button" className="primary-button" onClick={() => void saveAvailability()} disabled={availabilitySaving}><Save size={15} /> {availabilitySaving ? "Saving..." : "Save availability"}</button></div>
+              <div className="availability-message-heading"><span className="form-field-label">Message to send</span><button type="button" className="secondary-button" onClick={() => void copyAvailabilityMessage()}><Copy size={14} /> Copy message</button></div>
+              <textarea className="availability-message" value={availabilityMessage} onChange={(event) => setAvailabilityMessage(event.target.value)} rows={8} />
+            </div>
+          </section>
         </div>
       </section>
 
+      {lessonDetailsOpen && editingLesson && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setLessonDetailsOpen(false); }}>
+        <section className="lesson-modal event-details-modal" role="dialog" aria-modal="true" aria-labelledby="lesson-details-title">
+          <div className="modal-heading"><div><p className="section-kicker">Schedule block</p><h2 id="lesson-details-title">{editingLesson.title}</h2><p className="calendar-subtitle">{new Date(`${lessonFormDate}T12:00:00`).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p></div><button className="modal-close" aria-label="Close schedule details" onClick={() => setLessonDetailsOpen(false)}><X size={18} /></button></div>
+          <div className="event-detail-grid"><div><span>Time</span><strong>{editingLesson.time}–{editingLesson.end}</strong></div><div><span>Type</span><strong>{editingLesson.kind === "lesson" ? "Lesson" : "Personal"}</strong></div><div><span>Rate</span><strong>{editingLesson.kind === "lesson" ? `$${editingLesson.rate}/h` : "Not applicable"}</strong></div><div><span>Travel</span><strong>{editingLesson.travelMinutes} minutes</strong></div><div><span>Status</span><strong>{editingLesson.status}</strong></div>{editingLesson.detail && <div className="event-detail-wide"><span>Notes</span><strong>{editingLesson.detail}</strong></div>}</div>
+          <div className="modal-footer"><button type="button" className="delete-button" onClick={requestLessonDelete}>Delete block</button><span /><button type="button" className="secondary-button" onClick={() => { setLessonDetailsOpen(false); openLessonEditor(editingLesson); }}>Edit</button></div>
+        </section>
+      </div>}
+      {lessonDeleteConfirmOpen && editingLesson && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !isCloudSaving) setLessonDeleteConfirmOpen(false); }}>
+        <section className="lesson-modal delete-scope-modal" role="dialog" aria-modal="true" aria-labelledby="lesson-delete-title">
+          <div className="modal-heading"><div><p className="section-kicker">Remove block</p><h2 id="lesson-delete-title">Delete {editingLesson.title}?</h2></div><button className="modal-close" aria-label="Close delete confirmation" disabled={isCloudSaving} onClick={() => setLessonDeleteConfirmOpen(false)}><X size={18} /></button></div>
+          <div className="delete-warning"><strong>This cannot be undone.</strong><p>The block will be permanently removed from this schedule.</p></div>
+          <div className="modal-footer"><button type="button" className="secondary-button" disabled={isCloudSaving} onClick={() => setLessonDeleteConfirmOpen(false)}>Keep block</button><span /><button type="button" className="delete-button" disabled={isCloudSaving} onClick={() => void deleteLesson()}>Delete block</button></div>
+        </section>
+      </div>}
       {lessonModalOpen && editingLesson && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setLessonModalOpen(false); }}>
         <section className="lesson-modal" role="dialog" aria-modal="true" aria-labelledby="lesson-modal-title">
           <div className="modal-heading"><div><p className="section-kicker">Schedule block</p><h2 id="lesson-modal-title">{lessons.some((lesson) => lesson.id === editingLesson.id) ? "Edit block" : "Add to your day"}</h2></div><button className="modal-close" aria-label="Close lesson form" onClick={() => setLessonModalOpen(false)}><X size={18} /></button></div>
@@ -708,15 +847,12 @@ export default function Home() {
               <label className="form-field"><span>Ends</span><input type="time" value={editingLesson.end} onChange={(event) => setEditingLesson({ ...editingLesson, end: event.target.value })} /></label>
               <label className="form-field form-field-wide"><span>Notes</span><input value={editingLesson.detail} onChange={(event) => setEditingLesson({ ...editingLesson, detail: event.target.value })} placeholder="What is this block for?" /></label>
               <label className="form-field"><span>Type</span><select value={editingLesson.kind} onChange={(event) => setEditingLesson({ ...editingLesson, kind: event.target.value as Lesson["kind"] })}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label>
-              <label className="form-field"><span>Intensity</span><input type="number" min="0" max="10" step="0.5" value={editingLesson.intensity} onChange={(event) => setEditingLesson({ ...editingLesson, intensity: Number(event.target.value) })} /></label>
-              <label className="form-field"><span>Prep minutes</span><input type="number" min="0" value={editingLesson.prepMinutes} onChange={(event) => setEditingLesson({ ...editingLesson, prepMinutes: Number(event.target.value) })} /></label>
               <label className="form-field"><span>Travel minutes</span><input type="number" min="0" value={editingLesson.travelMinutes} onChange={(event) => setEditingLesson({ ...editingLesson, travelMinutes: Number(event.target.value) })} /></label>
               <label className="form-field"><span>Hourly rate</span><input type="number" min="0" step="0.5" value={editingLesson.rate} onChange={(event) => setEditingLesson({ ...editingLesson, rate: Number(event.target.value) })} /></label>
               <label className="form-field"><span>Status</span><select value={editingLesson.status} onChange={(event) => setEditingLesson({ ...editingLesson, status: event.target.value as Lesson["status"] })}><option value="scheduled">Scheduled</option><option value="completed">Completed</option></select></label>
             </div>
-            {!lessons.some((lesson) => lesson.id === editingLesson.id) && editingLesson.kind === "lesson" && <div className="suggested-slots"><span className="form-field-label">Suggested openings</span><div className="suggested-slot-list">{lessonSuggestions.map((slot) => <button type="button" className="suggested-slot" key={`${slot.date}-${slot.starts}-${slot.ends}`} onClick={() => { setLessonFormDate(slot.date); setSelectedDate(slot.date); setEditingLesson({ ...editingLesson, time: slot.starts, end: slot.ends }); }}><strong>{dateFromKey(slot.date).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}</strong><span>{slot.starts}–{slot.ends} · {slot.durationMinutes === 60 ? "1 hr" : "1.5 hrs"}</span></button>)}{lessonSuggestions.length === 0 && <p className="suggested-slot-empty">No open slots found this week.</p>}</div></div>}
             {lessonFormError && <p className="form-error">{lessonFormError}</p>}
-            <div className="modal-footer">{lessons.some((lesson) => lesson.id === editingLesson.id) && <button type="button" className="delete-button" onClick={deleteLesson} disabled={isCloudSaving}><Trash2 size={15} /> Delete</button>}<span /><button type="button" className="secondary-button" onClick={() => setLessonModalOpen(false)}>Cancel</button><button type="submit" className="primary-button" disabled={isCloudSaving}><Save size={15} /> {isCloudSaving ? "Saving..." : "Save block"}</button></div>
+            <div className="modal-footer"><span /><button type="button" className="secondary-button" onClick={() => setLessonModalOpen(false)}>Cancel</button><button type="submit" className="primary-button" disabled={isCloudSaving}><Save size={15} /> {isCloudSaving ? "Saving..." : "Save block"}</button></div>
           </form>
         </section>
       </div>}

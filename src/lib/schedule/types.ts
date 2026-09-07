@@ -1,7 +1,7 @@
 export type EventKind = "lesson" | "personal";
 export type EventTone = "blue" | "coral" | "teal" | "yellow";
 export type EventStatus = "scheduled" | "completed" | "cancelled" | "skipped";
-export type CalendarView = "week" | "month";
+export type CalendarView = "day" | "week" | "month";
 export type DeleteScope = "occurrence" | "following" | "all";
 export type StaminaState = "low" | "mid" | "high" | "overload";
 
@@ -48,6 +48,13 @@ export type ScheduleEventException = {
 export type CalendarRange = {
   start: Date;
   end: Date;
+};
+
+export type WeeklyAvailability = {
+  id?: string;
+  weekday: number;
+  starts: string;
+  ends: string;
 };
 
 export type SuggestedSlot = {

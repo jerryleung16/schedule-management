@@ -1,5 +1,5 @@
 import { addDays, dateKey } from "./dates";
-import type { CalendarRange, ScheduleOccurrence, StaminaState, SuggestedSlot } from "./types";
+import type { CalendarRange, ScheduleOccurrence, StaminaState, SuggestedSlot, WeeklyAvailability } from "./types";
 
 type BusyOccurrence = Pick<ScheduleOccurrence, "startsAt" | "endsAt">;
 
@@ -24,6 +24,61 @@ export function slotConflicts(startsAt: string | Date, endsAt: string | Date, bu
     const existingEnd = new Date(occurrence.endsAt).getTime();
     return start < existingEnd && end > existingStart;
   });
+}
+
+const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function minutesFromTime(value: string) {
+  const match = /^(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  return hours >= 0 && hours < 24 && minutes >= 0 && minutes < 60 ? hours * 60 + minutes : null;
+}
+
+function formatAvailabilityTime(value: string) {
+  const minutes = minutesFromTime(value) ?? 0;
+  const date = new Date(2000, 0, 1, Math.floor(minutes / 60), minutes % 60);
+  return date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+}
+
+export function validateWeeklyAvailability(intervals: WeeklyAvailability[]) {
+  const sorted = [...intervals].sort((left, right) => left.weekday - right.weekday || left.starts.localeCompare(right.starts));
+  for (const interval of sorted) {
+    const starts = minutesFromTime(interval.starts);
+    const ends = minutesFromTime(interval.ends);
+    if (interval.weekday < 0 || interval.weekday > 6 || starts === null || ends === null || ends <= starts) {
+      return "Each availability window needs a valid start and an end after it.";
+    }
+  }
+  for (let index = 1; index < sorted.length; index += 1) {
+    const previous = sorted[index - 1];
+    const current = sorted[index];
+    if (previous.weekday === current.weekday && (minutesFromTime(current.starts) ?? 0) < (minutesFromTime(previous.ends) ?? 0)) {
+      return `${weekdayNames[current.weekday]} has overlapping availability windows.`;
+    }
+  }
+  return "";
+}
+
+export function normalizeWeeklyAvailability(intervals: WeeklyAvailability[]) {
+  return [...intervals]
+    .filter((interval) => interval.weekday >= 0 && interval.weekday <= 6)
+    .sort((left, right) => left.weekday - right.weekday || left.starts.localeCompare(right.starts));
+}
+
+export function formatWeeklyAvailabilityMessage(intervals: WeeklyAvailability[], timezone?: string) {
+  const normalized = normalizeWeeklyAvailability(intervals);
+  const lines = ["Hi, here is my recurring weekly availability:", ""];
+  if (!normalized.length) lines.push("I do not have any availability windows set yet.");
+  for (let weekday = 0; weekday < 7; weekday += 1) {
+    const dayIntervals = normalized.filter((interval) => interval.weekday === weekday);
+    if (dayIntervals.length) {
+      lines.push(`${weekdayNames[weekday]}: ${dayIntervals.map((interval) => `${formatAvailabilityTime(interval.starts)}–${formatAvailabilityTime(interval.ends)}`).join(", ")}`);
+    }
+  }
+  if (timezone) lines.push("", `Timezone: ${timezone}`);
+  return lines.join("\n");
 }
 
 function priorityFor(day: Date, startMinutes: number, endMinutes: number): SuggestedSlot["priority"] {

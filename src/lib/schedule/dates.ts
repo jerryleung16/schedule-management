@@ -27,6 +27,11 @@ export function startOfMonth(date: Date) {
 }
 
 export function rangeForView(date: Date, view: CalendarView): CalendarRange {
+  if (view === "day") {
+    const start = dateFromKey(dateKey(date));
+    return { start, end: addDays(start, 1) };
+  }
+
   if (view === "month") {
     const monthStart = startOfMonth(date);
     const gridStart = startOfWeek(monthStart);
@@ -48,6 +53,10 @@ export function minutesSinceMidnight(date: Date) {
 }
 
 export function formatRangeLabel(date: Date, view: CalendarView) {
+  if (view === "day") {
+    return date.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+  }
+
   if (view === "month") {
     return date.toLocaleDateString("en-US", { month: "long", year: "numeric" });
   }
