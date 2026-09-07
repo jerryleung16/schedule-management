@@ -25,7 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
-import { formatWeeklyAvailabilityMessage, lessonHours, normalizeWeeklyAvailability, slotConflicts, staminaState, validateWeeklyAvailability } from "@/lib/schedule/availability";
+import { availabilityConflicts, formatWeeklyAvailabilityMessage, lessonHours, normalizeWeeklyAvailability, occupiedAvailabilityByWeekday, practicalFreeSlots, slotConflicts, staminaState, validateWeeklyAvailability } from "@/lib/schedule/availability";
 import { addDays, dateFromKey, dateKey, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
 import type { EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, WeeklyAvailability } from "@/lib/schedule/types";
@@ -39,17 +39,19 @@ type Lesson = {
   title: string;
   detail: string;
   kind: "lesson" | "personal";
-  tone: "blue" | "coral" | "teal" | "yellow";
+  tone: "blue" | "coral" | "teal" | "yellow" | "violet";
   intensity: number;
   prepMinutes: number;
   travelMinutes: number;
   rate: number;
-  status: "scheduled" | "completed";
+  status: EventStatus;
 };
 
 const storageKey = "daylight-lessons";
 const availabilityStorageKey = "daylight-weekly-availability";
 const scheduleDate = new Date().toISOString().slice(0, 10);
+const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const eventTones: EventTone[] = ["blue", "coral", "teal", "yellow", "violet"];
 const supabaseConfigured = Boolean(
   process.env.NEXT_PUBLIC_SUPABASE_URL &&
   process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
@@ -140,7 +142,7 @@ function lessonFromRow(row: {
   prep_minutes: number;
   travel_minutes: number;
   hourly_rate: number;
-  status: Lesson["status"];
+  status: EventStatus;
 }): Lesson {
   const start = new Date(row.starts_at);
   const end = new Date(row.ends_at);
@@ -261,6 +263,9 @@ function exceptionFromRow(row: Record<string, unknown>): ScheduleEventException 
     status: (row.status as EventStatus) ?? "cancelled",
     title: row.title ? String(row.title) : null,
     detail: row.detail ? String(row.detail) : null,
+    kind: row.kind === "personal" ? "personal" : row.kind === "lesson" ? "lesson" : null,
+    tone: row.tone ? row.tone as EventTone : null,
+    travelMinutes: row.travel_minutes === null || row.travel_minutes === undefined ? null : Number(row.travel_minutes),
     hourlyRate: row.hourly_rate === null || row.hourly_rate === undefined ? null : Number(row.hourly_rate),
     fixedFee: row.fixed_fee === null || row.fixed_fee === undefined ? null : Number(row.fixed_fee),
   };
@@ -316,6 +321,25 @@ export default function Home() {
         } else if (selectedDate !== scheduleDate) {
           setLessons([]);
         }
+        const localMonth = new Date(`${selectedDate}T12:00:00`);
+        const localMonthStart = new Date(localMonth.getFullYear(), localMonth.getMonth(), 1, 12);
+        const localMonthEnd = new Date(localMonth.getFullYear(), localMonth.getMonth() + 1, 1, 12);
+        const monthLessons: Lesson[] = [];
+        for (let day = new Date(localMonthStart); day < localMonthEnd; day = addDays(day, 1)) {
+          const dayKey = dateKey(day);
+          let dayLessons: Lesson[] = [];
+          if (dayKey === selectedDate) {
+            dayLessons = selectedLessons;
+          } else {
+            const stored = window.localStorage.getItem(`${storageKey}-${dayKey}`);
+            if (!stored) continue;
+            try { dayLessons = JSON.parse(stored) as Lesson[]; } catch { continue; }
+          }
+          monthLessons.push(...dayLessons);
+        }
+        const payableLessons = monthLessons.filter((lesson) => lesson.kind === "lesson" && lesson.status !== "cancelled" && lesson.status !== "skipped");
+        setMonthlyCompletedCount(payableLessons.length);
+        setMonthlyCompletedEarnings(payableLessons.reduce((total, lesson) => total + ((minutesFromTime(lesson.end) - minutesFromTime(lesson.time)) / 60) * lesson.rate, 0));
         const localRange = rangeForView(dateFromKey(selectedDate), "week");
         const localOccurrences: ScheduleOccurrence[] = [];
         for (let day = new Date(localRange.start); day < localRange.end; day = addDays(day, 1)) {
@@ -349,20 +373,26 @@ export default function Home() {
       const selectedMonth = new Date(`${selectedDate}T12:00:00`);
       const monthStart = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), 1, 0);
       const monthEnd = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() + 1, 1, 0);
-      let { data: monthData, error: monthError } = await supabase
+      const monthRange = { start: monthStart, end: monthEnd };
+      const canonicalMonth = await supabase
         .from("schedule_events")
-        .select("starts_at, ends_at, hourly_rate, status")
-        .gte("starts_at", monthStart.toISOString())
+        .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until")
         .lt("starts_at", monthEnd.toISOString());
-      if (monthError) {
-        const fallbackMonth = await supabase.from("lessons").select("starts_at, ends_at, hourly_rate, status").gte("starts_at", monthStart.toISOString()).lt("starts_at", monthEnd.toISOString());
-        monthData = fallbackMonth.data;
-        monthError = fallbackMonth.error;
-      }
-      if (!monthError) {
-        const completedMonth = (monthData ?? []).filter((row) => row.status === "completed");
-        setMonthlyCompletedCount(completedMonth.length);
-        setMonthlyCompletedEarnings(completedMonth.reduce((total, row) => total + ((new Date(row.ends_at).getTime() - new Date(row.starts_at).getTime()) / 3600000) * Number(row.hourly_rate), 0));
+      if (!canonicalMonth.error) {
+        const monthEvents = (canonicalMonth.data ?? []).map((row) => scheduleEventFromRow(row, userData.user.id));
+        const monthIds = (canonicalMonth.data ?? []).map((row) => row.id);
+        const monthExceptions = monthIds.length
+          ? await supabase.from("schedule_event_exceptions").select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").in("event_id", monthIds)
+          : { data: [], error: null };
+        const monthOccurrences = expandEvents(monthEvents, (monthExceptions.data ?? []).map((row) => exceptionFromRow(row)), monthRange);
+        const payableLessons = monthOccurrences.filter((occurrence) => occurrence.kind === "lesson" && occurrence.status !== "cancelled" && occurrence.status !== "skipped");
+        setMonthlyCompletedCount(payableLessons.length);
+        setMonthlyCompletedEarnings(payableLessons.reduce((total, occurrence) => total + ((new Date(occurrence.endsAt).getTime() - new Date(occurrence.startsAt).getTime()) / 3600000) * occurrence.hourlyRate, 0));
+      } else {
+        const fallbackMonth = await supabase.from("lessons").select("starts_at, ends_at, kind, hourly_rate, status").gte("starts_at", monthStart.toISOString()).lt("starts_at", monthEnd.toISOString());
+        const payableLessons = (fallbackMonth.data ?? []).filter((row) => row.kind === "lesson" && row.status !== "cancelled" && row.status !== "skipped");
+        setMonthlyCompletedCount(payableLessons.length);
+        setMonthlyCompletedEarnings(payableLessons.reduce((total, row) => total + ((new Date(row.ends_at).getTime() - new Date(row.starts_at).getTime()) / 3600000) * Number(row.hourly_rate), 0));
       }
       const weekRange = rangeForView(selectedMonth, "week");
       const weekStart = weekRange.start;
@@ -384,7 +414,7 @@ export default function Home() {
         const eventIds = (weekData ?? []).map((row) => row.id);
         let exceptions: ScheduleEventException[] = [];
         if (eventIds.length) {
-          const { data: exceptionData } = await supabase.from("schedule_event_exceptions").select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, hourly_rate, fixed_fee").in("event_id", eventIds);
+          const { data: exceptionData } = await supabase.from("schedule_event_exceptions").select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").in("event_id", eventIds);
           exceptions = (exceptionData ?? []).map((row) => exceptionFromRow(row));
         }
         const expanded = expandEvents(scheduleEvents, exceptions, weekRange);
@@ -445,7 +475,7 @@ export default function Home() {
       if (!cancelled) {
         const normalized = normalizeWeeklyAvailability(loaded);
         setAvailability(normalized);
-        setAvailabilityMessage(formatWeeklyAvailabilityMessage(normalized, Intl.DateTimeFormat().resolvedOptions().timeZone));
+        setAvailabilityMessage(formatWeeklyAvailabilityMessage(normalized));
       }
     };
     void loadAvailability();
@@ -465,7 +495,7 @@ export default function Home() {
   const updateAvailability = (next: WeeklyAvailability[]) => {
     const normalized = normalizeWeeklyAvailability(next);
     setAvailability(normalized);
-    setAvailabilityMessage(formatWeeklyAvailabilityMessage(normalized, Intl.DateTimeFormat().resolvedOptions().timeZone));
+    setAvailabilityMessage(formatWeeklyAvailabilityMessage(normalized));
     setAvailabilityError(validateWeeklyAvailability(normalized));
   };
 
@@ -477,10 +507,18 @@ export default function Home() {
     updateAvailability(availability.filter((_, itemIndex) => itemIndex !== index));
   };
 
+  const addFreeAvailabilitySlot = (slot: { weekday: number; starts: string; ends: string }) => {
+    updateAvailability([...availability, slot]);
+  };
+
   const saveAvailability = async () => {
     const validationError = validateWeeklyAvailability(availability);
     if (validationError) {
       setAvailabilityError(validationError);
+      return;
+    }
+    const conflicts = availabilityConflicts(availability, weeklyOccurrences);
+    if (conflicts.length) {
       return;
     }
     setAvailabilitySaving(true);
@@ -520,6 +558,11 @@ export default function Home() {
       setAvailabilityError("Clipboard access was unavailable. Select the message and copy it manually.");
     }
   };
+
+  const availabilityConflictsList = availabilityConflicts(availability, weeklyOccurrences);
+  const availabilityConflictsError = availabilityConflictsList.length
+    ? `${availabilityConflictsList[0].eventTitle} overlaps ${availabilityConflictsList[0].starts}–${availabilityConflictsList[0].ends} on ${weekdayNames[availabilityConflictsList[0].weekday]}.`
+    : "";
 
   const focusSection = (label: string, section: HTMLElement | null) => {
     setActiveNav(label);
@@ -701,9 +744,8 @@ export default function Home() {
   const displayedWeeklyLessonHours = supabaseConfigured ? weeklyLessonHours : localLessonHours;
   const weeklyStamina = staminaState(displayedWeeklyLessonHours);
   const weeklyStaminaMeter = Math.min(100, Math.round((displayedWeeklyLessonHours / 25) * 100));
-  const completedLessons = lessons.filter((lesson) => lesson.kind === "lesson" && lesson.status === "completed");
-  const currentEarnings = supabaseConfigured ? monthlyCompletedEarnings : completedLessons.reduce((total, lesson) => total + ((minutesFromTime(lesson.end) - minutesFromTime(lesson.time)) / 60) * lesson.rate, 0);
-  const displayedCompletedCount = supabaseConfigured ? monthlyCompletedCount : completedLessons.length;
+  const currentEarnings = monthlyCompletedEarnings;
+  const displayedCompletedCount = monthlyCompletedCount;
 
   return (
     <main className="app-shell">
@@ -774,7 +816,7 @@ export default function Home() {
             <article className="metric-card metric-earnings">
               <div className="metric-top"><span className="metric-label">{new Date(`${selectedDate}T12:00:00`).toLocaleDateString("en-US", { month: "long" })} earnings</span><span className="metric-icon"><ArrowUpRight size={16} /></span></div>
               <div className="metric-value currency">${currentEarnings.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-              <div className="metric-bottom"><span>{displayedCompletedCount} completed lessons</span><span className="trend-up">Live</span></div>
+              <div className="metric-bottom"><span>{displayedCompletedCount} scheduled lessons</span><span className="trend-up">Live</span></div>
               <div className="sparkline" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /></div>
             </article>
           </section>
@@ -811,10 +853,11 @@ export default function Home() {
           <section className="panel availability-panel" aria-labelledby="availability-title">
             <div className="panel-heading"><div><p className="section-kicker">Client-ready rhythm</p><h2 id="availability-title">Weekly availability</h2></div><Clock3 size={20} className="panel-icon" /></div>
             <div className="availability-content">
-              <p className="availability-intro">Keep your recurring teaching windows here, then send the pattern when a client asks what works.</p>
-              <div className="availability-days">{[1, 2, 3, 4, 5, 6, 0].map((weekday) => <div className="availability-day" key={weekday}><div className="availability-day-heading"><strong>{["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][weekday]}</strong><button type="button" className="text-button" onClick={() => addAvailabilityWindow(weekday)}><Plus size={13} /> Add window</button></div>{availability.map((interval, index) => interval.weekday === weekday && <div className="availability-window" key={`${interval.weekday}-${index}`}><input aria-label={`${["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][weekday]} start`} type="time" value={interval.starts} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, starts: event.target.value } : item))} /><span>to</span><input aria-label={`${["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][weekday]} end`} type="time" value={interval.ends} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, ends: event.target.value } : item))} /><button type="button" className="icon-button availability-remove" aria-label="Remove availability window" onClick={() => removeAvailabilityWindow(index)}><X size={14} /></button></div>)}</div>)}</div>
+              <p className="availability-intro">Set recurring teaching windows from the unoccupied periods in your selected week.</p>
+              <div className="availability-days">{[1, 2, 3, 4, 5, 6, 0].map((weekday) => { const day = addDays(rangeForView(dateFromKey(selectedDate), "week").start, (weekday + 6) % 7); const dayKey = dateKey(day); const occupied = occupiedAvailabilityByWeekday(weeklyOccurrences).filter((item) => item.weekday === weekday && item.eventDate === dayKey); const freeSlots = practicalFreeSlots(weeklyOccurrences).filter((slot) => slot.weekday === weekday); return <div className="availability-day" key={weekday}><div className="availability-day-heading"><div><strong>{weekdayNames[weekday]}</strong><span className="availability-date">{day.toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span></div><button type="button" className="text-button" onClick={() => addAvailabilityWindow(weekday)}><Plus size={13} /> Add window</button></div><div className="availability-occupied">{occupied.length ? occupied.map((item) => <span key={`${item.startsAt}-${item.endsAt}-${item.eventDate}`}>{item.title} · {String(Math.floor(item.starts / 60)).padStart(2, "0")}:{String(item.starts % 60).padStart(2, "0")}–{String(Math.floor(item.ends / 60)).padStart(2, "0")}:{String(item.ends % 60).padStart(2, "0")}</span>) : <span>No scheduled blocks</span>}</div><div className="availability-free-heading">Free time · 08:00–20:00</div>{freeSlots.length ? freeSlots.map((slot) => <div className="availability-free-slot" key={`${slot.starts}-${slot.ends}`}><span>{slot.starts}–{slot.ends}</span><button type="button" className="text-button" onClick={() => addFreeAvailabilitySlot(slot)}><Plus size={13} /> Use</button></div>) : <p className="availability-no-free">No free time in this range.</p>}{availability.map((interval, index) => interval.weekday === weekday && <div className="availability-window" key={`${interval.weekday}-${index}`}><input aria-label={`${weekdayNames[weekday]} start`} type="time" value={interval.starts} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, starts: event.target.value } : item))} /><span>to</span><input aria-label={`${weekdayNames[weekday]} end`} type="time" value={interval.ends} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, ends: event.target.value } : item))} /><button type="button" className="icon-button availability-remove" aria-label="Remove availability window" onClick={() => removeAvailabilityWindow(index)}><X size={14} /></button></div>)}</div>; })}</div>
               {availabilityError && <p className="form-error" role="alert">{availabilityError}</p>}
-              <div className="availability-actions"><button type="button" className="primary-button" onClick={() => void saveAvailability()} disabled={availabilitySaving}><Save size={15} /> {availabilitySaving ? "Saving..." : "Save availability"}</button></div>
+              {availabilityConflictsError && <p className="availability-conflict" role="alert">{availabilityConflictsError} Remove or adjust the window before saving.</p>}
+              <div className="availability-actions"><button type="button" className="primary-button" onClick={() => void saveAvailability()} disabled={availabilitySaving || Boolean(validateWeeklyAvailability(availability)) || Boolean(availabilityConflictsError)}><Save size={15} /> {availabilitySaving ? "Saving..." : "Save availability"}</button></div>
               <div className="availability-message-heading"><span className="form-field-label">Message to send</span><button type="button" className="secondary-button" onClick={() => void copyAvailabilityMessage()}><Copy size={14} /> Copy message</button></div>
               <textarea className="availability-message" value={availabilityMessage} onChange={(event) => setAvailabilityMessage(event.target.value)} rows={8} />
             </div>
@@ -846,9 +889,10 @@ export default function Home() {
               <label className="form-field"><span>Starts</span><input type="time" value={editingLesson.time} onChange={(event) => setEditingLesson({ ...editingLesson, time: event.target.value })} /></label>
               <label className="form-field"><span>Ends</span><input type="time" value={editingLesson.end} onChange={(event) => setEditingLesson({ ...editingLesson, end: event.target.value })} /></label>
               <label className="form-field form-field-wide"><span>Notes</span><input value={editingLesson.detail} onChange={(event) => setEditingLesson({ ...editingLesson, detail: event.target.value })} placeholder="What is this block for?" /></label>
-              <label className="form-field"><span>Type</span><select value={editingLesson.kind} onChange={(event) => setEditingLesson({ ...editingLesson, kind: event.target.value as Lesson["kind"] })}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label>
+              <label className="form-field"><span>Type</span><select value={editingLesson.kind} onChange={(event) => { const kind = event.target.value as Lesson["kind"]; setEditingLesson({ ...editingLesson, kind, tone: kind === "lesson" ? "coral" : "teal" }); }}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label>
               <label className="form-field"><span>Travel minutes</span><input type="number" min="0" value={editingLesson.travelMinutes} onChange={(event) => setEditingLesson({ ...editingLesson, travelMinutes: Number(event.target.value) })} /></label>
               <label className="form-field"><span>Hourly rate</span><input type="number" min="0" step="0.5" value={editingLesson.rate} onChange={(event) => setEditingLesson({ ...editingLesson, rate: Number(event.target.value) })} /></label>
+              <div className="tone-picker form-field-wide"><span className="form-field-label">Color</span><div>{eventTones.map((tone) => <button type="button" key={tone} aria-label={`Use ${tone} color`} className={`tone-swatch tone-${tone} ${editingLesson.tone === tone ? "tone-selected" : ""}`} onClick={() => setEditingLesson({ ...editingLesson, tone })}></button>)}</div></div>
               <label className="form-field"><span>Status</span><select value={editingLesson.status} onChange={(event) => setEditingLesson({ ...editingLesson, status: event.target.value as Lesson["status"] })}><option value="scheduled">Scheduled</option><option value="completed">Completed</option></select></label>
             </div>
             {lessonFormError && <p className="form-error">{lessonFormError}</p>}

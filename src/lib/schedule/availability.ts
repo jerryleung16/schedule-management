@@ -3,6 +3,24 @@ import type { CalendarRange, ScheduleOccurrence, StaminaState, SuggestedSlot, We
 
 type BusyOccurrence = Pick<ScheduleOccurrence, "startsAt" | "endsAt">;
 
+export type PracticalAvailabilitySlot = {
+  weekday: number;
+  starts: string;
+  ends: string;
+};
+
+export type AvailabilityConflict = {
+  weekday: number;
+  starts: string;
+  ends: string;
+  eventTitle: string;
+  eventStarts: string;
+  eventEnds: string;
+};
+
+export const practicalAvailabilityStart = 8 * 60;
+export const practicalAvailabilityEnd = 20 * 60;
+
 export function lessonHours(occurrences: Pick<ScheduleOccurrence, "startsAt" | "endsAt" | "kind">[]) {
   return occurrences
     .filter((occurrence) => occurrence.kind === "lesson")
@@ -36,6 +54,110 @@ function minutesFromTime(value: string) {
   return hours >= 0 && hours < 24 && minutes >= 0 && minutes < 60 ? hours * 60 + minutes : null;
 }
 
+function timeFromMinutes(minutes: number) {
+  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+}
+
+function formatTimeRange(starts: number, ends: number) {
+  return { starts: timeFromMinutes(starts), ends: timeFromMinutes(ends) };
+}
+
+function localDayStart(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function occurrenceParts(occurrence: Pick<ScheduleOccurrence, "startsAt" | "endsAt">) {
+  const start = new Date(occurrence.startsAt);
+  const end = new Date(occurrence.endsAt);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start) return [];
+
+  const parts: Array<{ weekday: number; starts: number; ends: number; dayKey: string }> = [];
+  for (let day = localDayStart(start); day < end; day = addDays(day, 1)) {
+    const dayStart = localDayStart(day);
+    const nextDayStart = addDays(dayStart, 1);
+    const starts = Math.max(start.getTime(), dayStart.getTime());
+    const ends = Math.min(end.getTime(), nextDayStart.getTime());
+    if (starts < ends) {
+      parts.push({
+        weekday: dayStart.getDay(),
+        starts: Math.max(0, Math.round((starts - dayStart.getTime()) / 60000)),
+        ends: Math.min(24 * 60, Math.round((ends - dayStart.getTime()) / 60000)),
+        dayKey: dateKey(dayStart),
+      });
+    }
+  }
+  return parts;
+}
+
+export function practicalFreeSlots(occurrences: BusyOccurrence[]): PracticalAvailabilitySlot[] {
+  const occupied = new Map<number, Array<{ starts: number; ends: number }>>();
+  for (const occurrence of occurrences) {
+    for (const part of occurrenceParts(occurrence)) {
+      const starts = Math.max(practicalAvailabilityStart, part.starts);
+      const ends = Math.min(practicalAvailabilityEnd, part.ends);
+      if (starts >= ends) continue;
+      const dayParts = occupied.get(part.weekday) ?? [];
+      dayParts.push({ starts, ends });
+      occupied.set(part.weekday, dayParts);
+    }
+  }
+
+  const freeSlots: PracticalAvailabilitySlot[] = [];
+  for (let weekday = 0; weekday < 7; weekday += 1) {
+    const merged = (occupied.get(weekday) ?? [])
+      .sort((left, right) => left.starts - right.starts)
+      .reduce<Array<{ starts: number; ends: number }>>((ranges, range) => {
+        const previous = ranges[ranges.length - 1];
+        if (previous && range.starts <= previous.ends) {
+          previous.ends = Math.max(previous.ends, range.ends);
+        } else {
+          ranges.push({ ...range });
+        }
+        return ranges;
+      }, []);
+    let cursor = practicalAvailabilityStart;
+    for (const range of merged) {
+      if (cursor < range.starts) freeSlots.push({ weekday, ...formatTimeRange(cursor, range.starts) });
+      cursor = Math.max(cursor, range.ends);
+    }
+    if (cursor < practicalAvailabilityEnd) freeSlots.push({ weekday, ...formatTimeRange(cursor, practicalAvailabilityEnd) });
+  }
+  return freeSlots;
+}
+
+export function occupiedAvailabilityByWeekday(occurrences: ScheduleOccurrence[]) {
+  return occurrences.flatMap((occurrence) => occurrenceParts(occurrence).map((part) => ({
+    ...part,
+    title: occurrence.title,
+    startsAt: occurrence.startsAt,
+    endsAt: occurrence.endsAt,
+    eventDate: part.dayKey,
+  })));
+}
+
+export function availabilityConflicts(intervals: WeeklyAvailability[], occurrences: ScheduleOccurrence[]): AvailabilityConflict[] {
+  const conflicts: AvailabilityConflict[] = [];
+  for (const interval of intervals) {
+    const starts = minutesFromTime(interval.starts);
+    const ends = minutesFromTime(interval.ends);
+    if (starts === null || ends === null || ends <= starts) continue;
+    for (const occurrence of occurrences) {
+      for (const part of occurrenceParts(occurrence)) {
+        if (part.weekday !== interval.weekday || starts >= part.ends || ends <= part.starts) continue;
+        conflicts.push({
+          weekday: interval.weekday,
+          starts: interval.starts,
+          ends: interval.ends,
+          eventTitle: occurrence.title,
+          eventStarts: `${part.dayKey} ${timeFromMinutes(part.starts)}`,
+          eventEnds: timeFromMinutes(part.ends),
+        });
+      }
+    }
+  }
+  return conflicts;
+}
+
 function formatAvailabilityTime(value: string) {
   const minutes = minutesFromTime(value) ?? 0;
   const date = new Date(2000, 0, 1, Math.floor(minutes / 60), minutes % 60);
@@ -67,9 +189,9 @@ export function normalizeWeeklyAvailability(intervals: WeeklyAvailability[]) {
     .sort((left, right) => left.weekday - right.weekday || left.starts.localeCompare(right.starts));
 }
 
-export function formatWeeklyAvailabilityMessage(intervals: WeeklyAvailability[], timezone?: string) {
+export function formatWeeklyAvailabilityMessage(intervals: WeeklyAvailability[]) {
   const normalized = normalizeWeeklyAvailability(intervals);
-  const lines = ["Hi, here is my recurring weekly availability:", ""];
+  const lines = ["Dear Client,", "", "Please find my recurring weekly availability below:", ""];
   if (!normalized.length) lines.push("I do not have any availability windows set yet.");
   for (let weekday = 0; weekday < 7; weekday += 1) {
     const dayIntervals = normalized.filter((interval) => interval.weekday === weekday);
@@ -77,7 +199,7 @@ export function formatWeeklyAvailabilityMessage(intervals: WeeklyAvailability[],
       lines.push(`${weekdayNames[weekday]}: ${dayIntervals.map((interval) => `${formatAvailabilityTime(interval.starts)}–${formatAvailabilityTime(interval.ends)}`).join(", ")}`);
     }
   }
-  if (timezone) lines.push("", `Timezone: ${timezone}`);
+  lines.push("", "Please let me know which of these times would be most convenient for you.", "", "Kind regards,");
   return lines.join("\n");
 }
 

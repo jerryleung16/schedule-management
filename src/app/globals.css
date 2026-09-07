@@ -1,3 +1,8 @@
+.event-violet { border-color: #8b78b6 !important; background: #f0edf8; color: #5d4c80; }
+.tone-picker > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.tone-swatch { width: 27px; height: 27px; border: 3px solid transparent; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(38,54,55,.18); }
+.tone-swatch:hover, .tone-selected { border-color: var(--ink); box-shadow: inset 0 0 0 1px #fff; }
+.tone-blue { background: #75a9c7; }.tone-coral { background: var(--coral); }.tone-teal { background: #63a9a0; }.tone-yellow { background: #d5ad57; }.tone-violet { background: #8b78b6; }
 @import "tailwindcss";
 
 :root {
@@ -113,7 +118,14 @@ h1, h2, p { margin: 0; }.welcome-row h1 { font-size: clamp(31px, 3.1vw, 46px); l
 .availability-day-heading, .availability-window, .availability-message-heading { display: flex; align-items: center; gap: 8px; }
 .availability-day-heading { justify-content: space-between; margin-bottom: 8px; }
 .availability-day-heading strong { color: #536563; font: 600 12px Arial, sans-serif; }
+.availability-date { display: block; margin-top: 3px; color: #9aa6a2; font: 10px Arial, sans-serif; }
 .availability-day-heading .text-button { margin: 0; }
+.availability-occupied { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 10px; }
+.availability-occupied span { padding: 4px 6px; border-left: 2px solid #c87868; background: #fff4f0; color: #8a625b; font: 10px/1.3 Arial, sans-serif; }
+.availability-free-heading { margin-top: 4px; color: #879492; font: 9px Arial, sans-serif; letter-spacing: .08em; text-transform: uppercase; }
+.availability-free-slot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 5px; padding: 6px 8px; border: 1px dashed #c9d8cf; background: #f5faf6; color: #4d7161; font: 11px Arial, sans-serif; }
+.availability-free-slot .text-button { margin: 0; color: #4f8069; }
+.availability-no-free { margin-top: 6px; color: #a96c62; font: 10px Arial, sans-serif; }
 .availability-window { margin-top: 6px; }
 .availability-window input { min-height: 34px; padding: 6px 8px; border: 1px solid #dfe3dc; border-radius: 5px; background: #fbfbf8; color: var(--ink); font: 12px Arial, sans-serif; }
 .availability-window span { color: #899592; font: 11px Arial, sans-serif; }
@@ -122,6 +134,7 @@ h1, h2, p { margin: 0; }.welcome-row h1 { font-size: clamp(31px, 3.1vw, 46px); l
 .availability-message-heading { justify-content: space-between; margin-top: 22px; }
 .availability-message-heading .form-field-label { margin: 0; }
 .availability-message { width: 100%; min-height: 150px; margin-top: 9px; padding: 11px; border: 1px solid #dfe3dc; border-radius: 6px; resize: vertical; background: #fbfbf8; color: var(--ink); font: 12px/1.5 Arial, sans-serif; outline: 0; }
+.availability-conflict { margin: 14px 0 0; padding: 10px 12px; border-left: 3px solid #c87868; background: #fff4f0; color: #8a5148; font: 11px/1.45 Arial, sans-serif; }
 .availability-message:focus, .availability-window input:focus { border-color: var(--coral); box-shadow: 0 0 0 3px rgba(220,118,93,.12); }
 @media (max-width: 680px) { .availability-days { grid-template-columns: 1fr; }.availability-content { padding-left: 16px; padding-right: 16px; }.availability-window input { min-width: 0; flex: 1; }.availability-message-heading { align-items: flex-start; flex-direction: column; } }
 .calendar-editor { max-height: calc(100vh - 40px); overflow: auto; }.delete-scope-modal { width: min(430px, calc(100vw - 32px)); }.delete-scope-options { display: grid; gap: 9px; }.delete-scope-options button { justify-content: flex-start; }

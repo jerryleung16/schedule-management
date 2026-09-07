@@ -1,8 +1,9 @@
 export type EventKind = "lesson" | "personal";
-export type EventTone = "blue" | "coral" | "teal" | "yellow";
+export type EventTone = "blue" | "coral" | "teal" | "yellow" | "violet";
 export type EventStatus = "scheduled" | "completed" | "cancelled" | "skipped";
 export type CalendarView = "day" | "week" | "month";
 export type DeleteScope = "occurrence" | "following" | "all";
+export type EditScope = "occurrence" | "all";
 export type StaminaState = "low" | "mid" | "high" | "overload";
 
 export type ScheduleEvent = {
@@ -41,6 +42,9 @@ export type ScheduleEventException = {
   status: EventStatus;
   title: string | null;
   detail: string | null;
+  kind: EventKind | null;
+  tone: EventTone | null;
+  travelMinutes: number | null;
   hourlyRate: number | null;
   fixedFee: number | null;
 };

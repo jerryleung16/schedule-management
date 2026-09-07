@@ -7,7 +7,7 @@ import { createClient } from "@/lib/supabase/client";
 import { slotConflicts } from "@/lib/schedule/availability";
 import { addDays, dateKey, dateFromKey, formatRangeLabel, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
-import type { CalendarView, DeleteScope, EventKind, EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence } from "@/lib/schedule/types";
+import type { CalendarView, DeleteScope, EditScope, EventKind, EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence } from "@/lib/schedule/types";
 
 type EventForm = {
   title: string;
@@ -26,6 +26,7 @@ type EventForm = {
 };
 
 const weekdayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const eventTones: EventTone[] = ["blue", "coral", "teal", "yellow", "violet"];
 const initialDateKey = "2000-01-01";
 const subscribeToBrowser = () => () => {};
 const getBrowserDateKey = () => dateKey(new Date());
@@ -123,7 +124,9 @@ export default function CalendarPage() {
   const [editorOpen, setEditorOpen] = useState(false);
   const [form, setForm] = useState<EventForm>(emptyForm());
   const [selectedOccurrence, setSelectedOccurrence] = useState<ScheduleOccurrence | null>(null);
+  const [editingOccurrence, setEditingOccurrence] = useState<ScheduleOccurrence | null>(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [editScopeOpen, setEditScopeOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deleteScopeOpen, setDeleteScopeOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -162,7 +165,7 @@ export default function CalendarPage() {
         if (eventIds.length) {
           const { data: exceptionData } = await supabase
             .from("schedule_event_exceptions")
-            .select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, hourly_rate, fixed_fee")
+            .select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee")
             .in("event_id", eventIds);
           if (!cancelled) setExceptions((exceptionData ?? []).map((row) => exceptionFromRow(row)));
         } else {
@@ -189,28 +192,37 @@ export default function CalendarPage() {
   };
 
   const openEditor = (date = dateKey(activeAnchorDate)) => {
+    setEditingOccurrence(null);
     setForm(emptyForm(date));
     setNotice("");
     setEditorOpen(true);
   };
 
-  const saveEvent = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setError("");
-    if (!form.title.trim()) {
-      setError("Give the event a name first.");
-      return;
-    }
-    const startsAt = new Date(`${form.date}T${form.starts}:00`);
-    const endsAt = new Date(`${form.date}T${form.ends}:00`);
-    if (endsAt <= startsAt) {
-      setError("End time must be after the start time.");
-      return;
-    }
-    if (slotConflicts(startsAt, endsAt, occurrences)) {
-      setError("That time overlaps an existing event.");
-      return;
-    }
+  const openOccurrenceEditor = (occurrence: ScheduleOccurrence) => {
+    const start = new Date(occurrence.startsAt);
+    const end = new Date(occurrence.endsAt);
+    setEditingOccurrence(occurrence);
+    setForm({
+      title: occurrence.title,
+      detail: occurrence.detail,
+      date: dateKey(start),
+      starts: `${String(start.getHours()).padStart(2, "0")}:${String(start.getMinutes()).padStart(2, "0")}`,
+      ends: `${String(end.getHours()).padStart(2, "0")}:${String(end.getMinutes()).padStart(2, "0")}`,
+      kind: occurrence.kind,
+      tone: occurrence.tone,
+      travelMinutes: occurrence.travelMinutes,
+      hourlyRate: occurrence.hourlyRate,
+      status: occurrence.status,
+      recurring: occurrence.isRecurring,
+      weekdays: occurrence.recurrenceWeekdays,
+      recurrenceUntil: occurrence.recurrenceUntil ?? "",
+    });
+    setNotice("");
+    setDetailsOpen(false);
+    setEditorOpen(true);
+  };
+
+  const persistEvent = async (scope: EditScope | null, startsAt: Date, endsAt: Date) => {
     const supabase = createClient();
     const payload = {
       user_id: userId,
@@ -230,43 +242,152 @@ export default function CalendarPage() {
       recurrence_weekdays: form.recurring ? form.weekdays : [],
       recurrence_until: form.recurring && form.recurrenceUntil ? form.recurrenceUntil : null,
     };
-    const { error: saveError } = await supabase.from("schedule_events").insert(payload);
-    let fallbackRow: Record<string, unknown> | null = null;
-    if (saveError) {
-      if (form.recurring) {
-        setError("Recurring events need migration 002 applied in Supabase.");
-        return;
-      }
-      const fallback = await supabase.from("lessons").insert({
-        id: crypto.randomUUID(),
-        user_id: userId,
-        starts_at: startsAt.toISOString(),
-        ends_at: endsAt.toISOString(),
+
+    if (editingOccurrence && scope === "occurrence") {
+      const { data, error: exceptionError } = await supabase.from("schedule_event_exceptions").upsert({
+        event_id: editingOccurrence.id,
+        original_starts_at: editingOccurrence.originalStartsAt,
+        starts_at: payload.starts_at,
+        ends_at: payload.ends_at,
         title: payload.title,
         detail: payload.detail,
         kind: payload.kind,
         tone: payload.tone,
-        intensity: 2,
-        prep_minutes: 0,
         travel_minutes: payload.travel_minutes,
         hourly_rate: payload.hourly_rate,
-        status: payload.status === "completed" ? "completed" : "scheduled",
-      }).select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status").single();
-      if (fallback.error) {
-        setError(fallback.error.message || saveError.message);
+        fixed_fee: payload.fixed_fee,
+        status: payload.status,
+      }, { onConflict: "event_id,original_starts_at" }).select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").single();
+      if (exceptionError) {
+        setError(exceptionError.message || "Apply migration 004 to edit one recurring occurrence.");
         return;
       }
-      fallbackRow = fallback.data;
+      setExceptions((current) => [...current.filter((item) => !(item.eventId === editingOccurrence.id && item.originalStartsAt === editingOccurrence.originalStartsAt)), exceptionFromRow(data)]);
+      setNotice("This occurrence was updated.");
+    } else if (editingOccurrence) {
+      if (scope === "all" && editingOccurrence.exceptionId) {
+        const { error: exceptionDeleteError } = await supabase.from("schedule_event_exceptions").delete().eq("id", editingOccurrence.exceptionId);
+        if (exceptionDeleteError) {
+          setError(exceptionDeleteError.message);
+          return;
+        }
+        setExceptions((current) => current.filter((item) => item.id !== editingOccurrence.exceptionId));
+      }
+      const { error: updateError } = await supabase.from("schedule_events").update(payload).eq("id", editingOccurrence.id);
+      const error = updateError
+        ? (await supabase.from("lessons").update({
+          starts_at: payload.starts_at,
+          ends_at: payload.ends_at,
+          title: payload.title,
+          detail: payload.detail,
+          kind: payload.kind,
+          tone: payload.tone,
+          travel_minutes: payload.travel_minutes,
+          hourly_rate: payload.hourly_rate,
+          status: payload.status === "completed" ? "completed" : "scheduled",
+        }).eq("id", editingOccurrence.id)).error
+        : null;
+      if (error) {
+        setError(error.message || updateError?.message || "The event could not be updated.");
+        return;
+      }
+      setEvents((current) => current.map((item) => item.id === editingOccurrence.id ? eventFromRow({
+        ...item,
+        starts_at: payload.starts_at,
+        ends_at: payload.ends_at,
+        timezone: payload.timezone,
+        title: payload.title,
+        detail: payload.detail,
+        kind: payload.kind,
+        tone: payload.tone,
+        travel_minutes: payload.travel_minutes,
+        hourly_rate: payload.hourly_rate,
+        status: payload.status,
+        recurrence_weekdays: payload.recurrence_weekdays,
+        recurrence_until: payload.recurrence_until,
+      }, userId) : item));
+      setNotice(scope === "all" ? "The recurring series was updated." : "Event updated.");
+    } else {
+      const { error: saveError } = await supabase.from("schedule_events").insert(payload);
+      let fallbackRow: Record<string, unknown> | null = null;
+      if (saveError) {
+        if (form.recurring) {
+          setError("Recurring events need migration 002 applied in Supabase.");
+          return;
+        }
+        const fallback = await supabase.from("lessons").insert({
+          id: crypto.randomUUID(),
+          user_id: userId,
+          starts_at: startsAt.toISOString(),
+          ends_at: endsAt.toISOString(),
+          title: payload.title,
+          detail: payload.detail,
+          kind: payload.kind,
+          tone: payload.tone,
+          intensity: 2,
+          prep_minutes: 0,
+          travel_minutes: payload.travel_minutes,
+          hourly_rate: payload.hourly_rate,
+          status: payload.status === "completed" ? "completed" : "scheduled",
+        }).select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status").single();
+        if (fallback.error) {
+          setError(fallback.error.message || saveError.message);
+          return;
+        }
+        fallbackRow = fallback.data;
+      }
+      if (fallbackRow) setEvents((current) => [...current, eventFromRow(fallbackRow, userId)]);
+      else {
+        const { data } = await supabase.from("schedule_events").select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until").lt("starts_at", new Date(rangeEndMs).toISOString()).order("starts_at", { ascending: true });
+        if (data) setEvents(data.map((row) => eventFromRow(row, userId)));
+      }
+      setNotice(form.recurring ? "Weekly event added to your calendar." : "Event added to your calendar.");
     }
     setEditorOpen(false);
-    setNotice(form.recurring ? "Weekly event added to your calendar." : "Event added to your calendar.");
+    setEditScopeOpen(false);
+    setEditingOccurrence(null);
     setAnchorDate(dateFromKey(form.date));
-    if (fallbackRow) {
-      setEvents((current) => [...current, eventFromRow(fallbackRow, userId)]);
-    } else {
-      const { data } = await supabase.from("schedule_events").select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until").lt("starts_at", new Date(rangeEndMs).toISOString()).order("starts_at", { ascending: true });
-      if (data) setEvents(data.map((row) => eventFromRow(row, userId)));
+  };
+
+  const saveEvent = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setError("");
+    if (!form.title.trim()) {
+      setError("Give the event a name first.");
+      return;
     }
+    const startsAt = new Date(`${form.date}T${form.starts}:00`);
+    const endsAt = new Date(`${form.date}T${form.ends}:00`);
+    if (endsAt <= startsAt) {
+      setError("End time must be after the start time.");
+      return;
+    }
+    const busyOccurrences = editingOccurrence
+      ? occurrences.filter((item) => editingOccurrence.isRecurring ? item.id !== editingOccurrence.id : item.occurrenceKey !== editingOccurrence.occurrenceKey)
+      : occurrences;
+    if (slotConflicts(startsAt, endsAt, busyOccurrences)) {
+      setError("That time overlaps an existing event.");
+      return;
+    }
+    if (editingOccurrence?.isRecurring) {
+      setEditScopeOpen(true);
+      return;
+    }
+    await persistEvent(editingOccurrence ? "all" : null, startsAt, endsAt);
+  };
+
+  const saveEditedScope = async (scope: EditScope) => {
+    const startsAt = new Date(`${form.date}T${form.starts}:00`);
+    const endsAt = new Date(`${form.date}T${form.ends}:00`);
+    const busyOccurrences = editingOccurrence
+      ? occurrences.filter((item) => item.id !== editingOccurrence.id)
+      : occurrences;
+    if (slotConflicts(startsAt, endsAt, busyOccurrences)) {
+      setEditScopeOpen(false);
+      setError("That time overlaps an existing event.");
+      return;
+    }
+    await persistEvent(scope, startsAt, endsAt);
   };
 
   const occurrencesForDay = (day: Date) => occurrences.filter((item) => occurrenceDay(item) === dateKey(day));
@@ -344,8 +465,9 @@ export default function CalendarPage() {
         </section>
         <p className="calendar-footnote"><Clock3 size={14} /> {timezone} · Double-click a day to add an event.</p>
       </div>
-      {editorOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setEditorOpen(false); }}><section className="lesson-modal calendar-editor" role="dialog" aria-modal="true" aria-labelledby="event-modal-title"><div className="modal-heading"><div><p className="section-kicker">Calendar event</p><h2 id="event-modal-title">Add to your time</h2></div><button className="modal-close" aria-label="Close event form" onClick={() => setEditorOpen(false)}><X size={18} /></button></div><form onSubmit={saveEvent}><div className="form-grid"><label className="form-field form-field-wide"><span>Name</span><input autoFocus value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="e.g. Biology · Alex" /></label><label className="form-field form-field-wide"><span>Notes</span><input value={form.detail} onChange={(event) => setForm({ ...form, detail: event.target.value })} placeholder="What is this block for?" /></label><label className="form-field"><span>Date</span><input type="date" value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} /></label><label className="form-field"><span>Type</span><select value={form.kind} onChange={(event) => setForm({ ...form, kind: event.target.value as EventKind })}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label><label className="form-field"><span>Starts</span><input type="time" value={form.starts} onChange={(event) => setForm({ ...form, starts: event.target.value })} /></label><label className="form-field"><span>Ends</span><input type="time" value={form.ends} onChange={(event) => setForm({ ...form, ends: event.target.value })} /></label><label className="form-field"><span>Hourly rate</span><input type="number" min="0" step="0.5" value={form.hourlyRate} onChange={(event) => setForm({ ...form, hourlyRate: Number(event.target.value) })} /></label><label className="form-field"><span>Travel minutes</span><input type="number" min="0" value={form.travelMinutes} onChange={(event) => setForm({ ...form, travelMinutes: Number(event.target.value) })} /></label><label className="form-field"><span>Repeat</span><select value={form.recurring ? "weekly" : "once"} onChange={(event) => setForm({ ...form, recurring: event.target.value === "weekly" })}><option value="once">One time</option><option value="weekly">Weekly</option></select></label>{form.recurring && <label className="form-field"><span>Repeat until</span><input type="date" min={form.date} value={form.recurrenceUntil} onChange={(event) => setForm({ ...form, recurrenceUntil: event.target.value })} /> </label>}{form.recurring && <div className="weekday-picker form-field-wide"><span className="form-field-label">Days</span><div>{weekdayLabels.map((label, index) => <button type="button" className={form.weekdays.includes(index) ? "weekday-active" : ""} key={label} onClick={() => setForm({ ...form, weekdays: form.weekdays.includes(index) ? form.weekdays.filter((day) => day !== index) : [...form.weekdays, index] })}>{label}</button>)}</div></div>}</div>{error && <p className="form-error">{error}</p>}<div className="modal-footer"><span /><button type="button" className="secondary-button" onClick={() => setEditorOpen(false)}>Cancel</button><button type="submit" className="primary-button"><Plus size={15} /> Save event</button></div></form></section></div>}
-      {detailsOpen && selectedOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setDetailsOpen(false); }}><section className="lesson-modal event-details-modal" role="dialog" aria-modal="true" aria-labelledby="event-details-title"><div className="modal-heading"><div><p className="section-kicker">Event details</p><h2 id="event-details-title">{selectedOccurrence.title}</h2><p className="calendar-subtitle">{new Date(selectedOccurrence.startsAt).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p></div><button className="modal-close" aria-label="Close event details" onClick={() => setDetailsOpen(false)}><X size={18} /></button></div><div className="event-detail-grid"><div><span>Time</span><strong>{formatTime(selectedOccurrence.startsAt)}–{formatTime(selectedOccurrence.endsAt)}</strong></div><div><span>Type</span><strong>{selectedOccurrence.kind === "lesson" ? "Lesson" : "Personal"}</strong></div><div><span>Rate</span><strong>{selectedOccurrence.kind === "lesson" ? `$${selectedOccurrence.fixedFee ?? selectedOccurrence.hourlyRate}/h` : "Not applicable"}</strong></div><div><span>Travel</span><strong>{selectedOccurrence.travelMinutes} minutes</strong></div><div><span>Status</span><strong>{selectedOccurrence.status}</strong></div><div><span>Repeat</span><strong>{selectedOccurrence.isRecurring ? "Weekly series" : "One time"}</strong></div>{selectedOccurrence.detail && <div className="event-detail-wide"><span>Notes</span><strong>{selectedOccurrence.detail}</strong></div>}</div><div className="modal-footer"><button type="button" className="delete-button" onClick={requestDelete}>Delete event</button><span /><button type="button" className="secondary-button" onClick={() => setDetailsOpen(false)}>Close</button></div></section></div>}
+      {editorOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setEditorOpen(false); }}><section className="lesson-modal calendar-editor" role="dialog" aria-modal="true" aria-labelledby="event-modal-title"><div className="modal-heading"><div><p className="section-kicker">Calendar event</p><h2 id="event-modal-title">{editingOccurrence ? "Edit event" : "Add to your time"}</h2></div><button className="modal-close" aria-label="Close event form" onClick={() => setEditorOpen(false)}><X size={18} /></button></div><form onSubmit={saveEvent}><div className="form-grid"><label className="form-field form-field-wide"><span>Name</span><input autoFocus value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="e.g. Biology · Alex" /></label><label className="form-field form-field-wide"><span>Notes</span><input value={form.detail} onChange={(event) => setForm({ ...form, detail: event.target.value })} placeholder="What is this block for?" /></label><label className="form-field"><span>Date</span><input type="date" value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} /></label><label className="form-field"><span>Type</span><select value={form.kind} onChange={(event) => { const kind = event.target.value as EventKind; setForm({ ...form, kind, tone: kind === "lesson" ? "coral" : "teal" }); }}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label><label className="form-field"><span>Starts</span><input type="time" value={form.starts} onChange={(event) => setForm({ ...form, starts: event.target.value })} /></label><label className="form-field"><span>Ends</span><input type="time" value={form.ends} onChange={(event) => setForm({ ...form, ends: event.target.value })} /></label><label className="form-field"><span>Hourly rate</span><input type="number" min="0" step="0.5" value={form.hourlyRate} onChange={(event) => setForm({ ...form, hourlyRate: Number(event.target.value) })} /></label><label className="form-field"><span>Travel minutes</span><input type="number" min="0" value={form.travelMinutes} onChange={(event) => setForm({ ...form, travelMinutes: Number(event.target.value) })} /></label><div className="tone-picker form-field-wide"><span className="form-field-label">Color</span><div>{eventTones.map((tone) => <button type="button" key={tone} aria-label={`Use ${tone} color`} className={`tone-swatch tone-${tone} ${form.tone === tone ? "tone-selected" : ""}`} onClick={() => setForm({ ...form, tone })}></button>)}</div></div><label className="form-field"><span>Repeat</span><select value={form.recurring ? "weekly" : "once"} onChange={(event) => setForm({ ...form, recurring: event.target.value === "weekly" })}><option value="once">One time</option><option value="weekly">Weekly</option></select></label>{form.recurring && <label className="form-field"><span>Repeat until</span><input type="date" min={form.date} value={form.recurrenceUntil} onChange={(event) => setForm({ ...form, recurrenceUntil: event.target.value })} /> </label>}{form.recurring && <div className="weekday-picker form-field-wide"><span className="form-field-label">Days</span><div>{weekdayLabels.map((label, index) => <button type="button" className={form.weekdays.includes(index) ? "weekday-active" : ""} key={label} onClick={() => setForm({ ...form, weekdays: form.weekdays.includes(index) ? form.weekdays.filter((day) => day !== index) : [...form.weekdays, index] })}>{label}</button>)}</div></div>}</div>{error && <p className="form-error">{error}</p>}<div className="modal-footer"><span /><button type="button" className="secondary-button" onClick={() => setEditorOpen(false)}>Cancel</button><button type="submit" className="primary-button"><Plus size={15} /> {editingOccurrence ? "Save changes" : "Save event"}</button></div></form></section></div>}
+      {editScopeOpen && editingOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setEditScopeOpen(false); }}><section className="lesson-modal delete-scope-modal" role="dialog" aria-modal="true" aria-labelledby="edit-scope-title"><div className="modal-heading"><div><p className="section-kicker">Choose edit scope</p><h2 id="edit-scope-title">{editingOccurrence.title}</h2><p className="calendar-subtitle">Apply these changes to the selected occurrence or the full weekly series.</p></div><button className="modal-close" aria-label="Close edit scope" onClick={() => setEditScopeOpen(false)}><X size={18} /></button></div><div className="delete-scope-options"><button className="secondary-button" onClick={() => void saveEditedScope("occurrence")}>This occurrence</button><button className="primary-button" onClick={() => void saveEditedScope("all")}>Entire series</button></div></section></div>}
+      {detailsOpen && selectedOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setDetailsOpen(false); }}><section className="lesson-modal event-details-modal" role="dialog" aria-modal="true" aria-labelledby="event-details-title"><div className="modal-heading"><div><p className="section-kicker">Event details</p><h2 id="event-details-title">{selectedOccurrence.title}</h2><p className="calendar-subtitle">{new Date(selectedOccurrence.startsAt).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p></div><button className="modal-close" aria-label="Close event details" onClick={() => setDetailsOpen(false)}><X size={18} /></button></div><div className="event-detail-grid"><div><span>Time</span><strong>{formatTime(selectedOccurrence.startsAt)}–{formatTime(selectedOccurrence.endsAt)}</strong></div><div><span>Type</span><strong>{selectedOccurrence.kind === "lesson" ? "Lesson" : "Personal"}</strong></div><div><span>Rate</span><strong>{selectedOccurrence.kind === "lesson" ? `$${selectedOccurrence.fixedFee ?? selectedOccurrence.hourlyRate}/h` : "Not applicable"}</strong></div><div><span>Travel</span><strong>{selectedOccurrence.travelMinutes} minutes</strong></div><div><span>Status</span><strong>{selectedOccurrence.status}</strong></div><div><span>Repeat</span><strong>{selectedOccurrence.isRecurring ? "Weekly series" : "One time"}</strong></div>{selectedOccurrence.detail && <div className="event-detail-wide"><span>Notes</span><strong>{selectedOccurrence.detail}</strong></div>}</div><div className="modal-footer"><button type="button" className="delete-button" onClick={requestDelete}>Delete event</button><span /><button type="button" className="secondary-button" onClick={() => openOccurrenceEditor(selectedOccurrence)}>Edit</button><button type="button" className="secondary-button" onClick={() => setDetailsOpen(false)}>Close</button></div></section></div>}
       {deleteConfirmOpen && selectedOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !deleting) setDeleteConfirmOpen(false); }}><section className="lesson-modal delete-scope-modal" role="dialog" aria-modal="true" aria-labelledby="delete-warning-title"><div className="modal-heading"><div><p className="section-kicker">Remove event</p><h2 id="delete-warning-title">Delete {selectedOccurrence.title}?</h2></div><button className="modal-close" aria-label="Close delete warning" disabled={deleting} onClick={() => setDeleteConfirmOpen(false)}><X size={18} /></button></div><div className="delete-warning"><strong>This cannot be undone.</strong><p>{selectedOccurrence.isRecurring ? "The next step will let you choose whether to remove this occurrence, this and following occurrences, or the entire series." : "This event will be permanently removed from your calendar."}</p></div><div className="modal-footer"><button type="button" className="secondary-button" disabled={deleting} onClick={() => setDeleteConfirmOpen(false)}>Keep event</button><span />{selectedOccurrence.isRecurring ? <button type="button" className="delete-button" disabled={deleting} onClick={continueDelete}>Choose deletion scope</button> : <button type="button" className="delete-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("all")}>Delete event</button>}</div></section></div>}
       {deleteScopeOpen && selectedOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !deleting) setDeleteScopeOpen(false); }}><section className="lesson-modal delete-scope-modal" role="dialog" aria-modal="true" aria-labelledby="delete-event-title"><div className="modal-heading"><div><p className="section-kicker">Choose deletion scope</p><h2 id="delete-event-title">{selectedOccurrence.title}</h2><p className="calendar-subtitle">{formatTime(selectedOccurrence.startsAt)} · {new Date(selectedOccurrence.startsAt).toLocaleDateString()}</p></div><button className="modal-close" aria-label="Close deletion scope" disabled={deleting} onClick={() => setDeleteScopeOpen(false)}><X size={18} /></button></div><div className="delete-scope-options"><button className="secondary-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("occurrence")}>This occurrence</button><button className="secondary-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("following")}>This and following</button><button className="delete-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("all")}>All events in series</button></div></section></div>}
     </main>
@@ -362,6 +484,9 @@ function exceptionFromRow(row: Record<string, unknown>): ScheduleEventException 
     status: (row.status as EventStatus) ?? "cancelled",
     title: row.title ? String(row.title) : null,
     detail: row.detail ? String(row.detail) : null,
+    kind: row.kind === "personal" ? "personal" : row.kind === "lesson" ? "lesson" : null,
+    tone: row.tone ? row.tone as EventTone : null,
+    travelMinutes: row.travel_minutes === null || row.travel_minutes === undefined ? null : Number(row.travel_minutes),
     hourlyRate: row.hourly_rate === null || row.hourly_rate === undefined ? null : Number(row.hourly_rate),
     fixedFee: row.fixed_fee === null || row.fixed_fee === undefined ? null : Number(row.fixed_fee),
   };
