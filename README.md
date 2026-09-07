@@ -1,34 +1,73 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Daylight
 
-## Getting Started
+Daylight is a personal schedule and lesson planning workspace. It is designed to make time, teaching income, and physical energy visible in one place.
 
-First, run the development server:
+## Current milestone
+
+The first implementation is a responsive dashboard prototype with:
+
+- Daily schedule blocks for lessons, personal time, and recovery.
+- Daily energy and weekly load summaries.
+- Current-month completed earnings with no synthetic starting balance.
+- Week and month calendar views with range navigation.
+- One-time and weekly recurring event creation with optional end dates.
+- A general arithmetic calculator with keyboard-friendly keypad controls.
+- Safe calculator parsing for numbers, decimals, parentheses, addition, subtraction, multiplication, and division.
+- Add and edit schedule blocks with time validation, intensity, preparation, and travel inputs.
+- Delete schedule blocks and keep changes in browser localStorage between visits.
+- Live energy and weekly load summaries based on the current schedule.
+- Supabase SSR authentication and cloud lesson persistence when environment variables are configured.
+- A mobile navigation layout and desktop sidebar.
+
+Without Supabase variables, the app runs in local demo mode. With Supabase configured, login is required and lesson add/edit/delete operations are stored in the authenticated user's database rows.
+
+## Run locally
+
+Install dependencies and start the development server:
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Enable Supabase
 
-## Learn More
+1. Create a project at [supabase.com](https://supabase.com).
+2. In the Supabase Authentication dashboard, create your private user with email/password.
+3. Copy `.env.example` to `.env.local` and fill in the project URL and publishable key from the Supabase Connect dialog.
+4. Run `supabase/migrations/001_create_profiles_and_lessons.sql` in the Supabase SQL Editor.
+5. Run `supabase/migrations/002_schedule_events_and_exceptions.sql` after the initial migration. It creates the range-aware event store, recurrence fields, exception table, indexes, RLS policies, and migrates existing lessons.
+6. Restart the development server. The dashboard will redirect signed-out visitors to `/login`.
 
-To learn more about Next.js, take a look at the following resources:
+The first migration creates `profiles` and `lessons`, a profile trigger for new users, ownership indexes, and explicit Row Level Security policies. The second migration adds `schedule_events` and `schedule_event_exceptions` for one-time and weekly events. Existing lessons are copied into the new event table; keep the original table during the transition. Do not put a Supabase secret/service-role key in `.env.local`, browser code, GitHub, or Vercel client variables.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+For Vercel, add these same two variables under Project Settings > Environment Variables:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```env
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
+```
 
-## Deploy on Vercel
+Then add your local and production URLs under Supabase Authentication > URL Configuration.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Validate
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+npm run lint
+npm run build
+```
+
+The calendar uses the profile timezone for display, expands weekly events only within the visible range, and keeps the event series separate from occurrence exceptions. Scheduled events do not count toward actual earnings; completed lesson events use hourly duration multiplied by rate, while skipped and cancelled events are excluded.
+
+## Planned product direction
+
+- Next.js and TypeScript for the web application.
+- Supabase Authentication and PostgreSQL for private cross-device data.
+- Vercel for deployment from GitHub.
+- Configurable daily and weekly stamina budgets using weighted lesson load points.
+- Hourly and fixed lesson rates, with completed lessons contributing to actual earnings.
+- Recurring lessons with reschedule, skip, and cancellation exceptions.
+
+External calendar synchronization, tax calculation, invoicing, and payment reconciliation are intentionally outside the first release.
