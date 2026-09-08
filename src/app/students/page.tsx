@@ -12,6 +12,7 @@ const storageKey = "daylight-students";
 const supabaseConfigured = Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY);
 
 type StudentForm = Pick<Student, "name" | "email" | "phone" | "notes">;
+type SummaryOccurrence = { id: string; studentId: string | null; startsAt: string; status: EventStatus };
 type StudentSummary = { upcomingCount: number; nextLesson: string | null; recentLesson: string | null; recentCount: number };
 
 const emptyForm: StudentForm = { name: "", email: "", phone: "", notes: "" };
@@ -49,7 +50,7 @@ function exceptionFromRow(row: Record<string, unknown>): ScheduleEventException 
   };
 }
 
-function summarizeOccurrences(students: Student[], occurrences: Array<{ studentId: string | null; startsAt: string; status: EventStatus }>, now = new Date()) {
+function summarizeOccurrences(students: Student[], occurrences: SummaryOccurrence[], now = new Date()) {
   const summaries: Record<string, StudentSummary> = {};
   students.forEach((student) => { summaries[student.id] = { upcomingCount: 0, nextLesson: null, recentLesson: null, recentCount: 0 }; });
   occurrences.filter((item) => item.studentId && summaries[item.studentId] && item.status !== "cancelled" && item.status !== "skipped").forEach((item) => {
@@ -97,14 +98,14 @@ export default function StudentsPage() {
           try { localStudents = JSON.parse(stored) as Student[]; setStudents(localStudents); } catch { window.localStorage.removeItem(storageKey); }
         }
         const now = new Date();
-        const localOccurrences: Array<{ studentId: string | null; startsAt: string; status: EventStatus }> = [];
+        const localOccurrences: SummaryOccurrence[] = [];
         for (let offset = -90; offset <= 90; offset += 1) {
           const day = addDays(now, offset);
           const dayStorage = window.localStorage.getItem(`daylight-lessons-${dateKey(day)}`);
           if (!dayStorage) continue;
           try {
             const lessons = JSON.parse(dayStorage) as Array<{ studentId?: string | null; time: string; status?: EventStatus; kind?: string }>;
-            lessons.forEach((lesson) => { if (lesson.kind !== "personal" && lesson.studentId) localOccurrences.push({ studentId: lesson.studentId, startsAt: new Date(`${dateKey(day)}T${lesson.time}:00`).toISOString(), status: lesson.status ?? "scheduled" }); });
+            lessons.forEach((lesson, lessonIndex) => { if (lesson.kind !== "personal" && lesson.studentId) localOccurrences.push({ id: `local-${dateKey(day)}-${lessonIndex}`, studentId: lesson.studentId, startsAt: new Date(`${dateKey(day)}T${lesson.time}:00`).toISOString(), status: lesson.status ?? "scheduled" }); });
           } catch { }
         }
         setSummaries(summarizeOccurrences(localStudents, localOccurrences, now));
@@ -133,16 +134,16 @@ export default function StudentsPage() {
         const rangeEnd = addDays(new Date(), 91);
         const range = { start: rangeStart, end: rangeEnd };
         const { data: eventData, error: eventError } = await supabase.from("schedule_events").select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id").lt("starts_at", rangeEnd.toISOString());
-        if (!eventError) {
-          const eventRows = eventData ?? [];
-          const eventIds = eventRows.map((row) => row.id);
-          const exceptionResult = eventIds.length ? await supabase.from("schedule_event_exceptions").select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").in("event_id", eventIds) : { data: [], error: null };
-          const occurrences = expandEvents(eventRows.map((row) => eventFromRow(row, authData.user.id)), (exceptionResult.data ?? []).map((row) => exceptionFromRow(row)), range);
-          setSummaries(summarizeOccurrences(loadedStudents, occurrences));
-        } else {
-          const legacy = await supabase.from("lessons").select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id").gte("starts_at", rangeStart.toISOString()).lt("starts_at", rangeEnd.toISOString());
-          setSummaries(summarizeOccurrences(loadedStudents, (legacy.data ?? []).map((row) => ({ studentId: row.student_id ? String(row.student_id) : null, startsAt: String(row.starts_at), status: (row.status as EventStatus) ?? "scheduled" }))));
-        }
+        const eventRows = eventError ? [] : (eventData ?? []);
+        const eventIds = eventRows.map((row) => String(row.id));
+        const exceptionResult = eventIds.length ? await supabase.from("schedule_event_exceptions").select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").in("event_id", eventIds) : { data: [], error: null };
+        const canonicalOccurrences = expandEvents(eventRows.map((row) => eventFromRow(row, authData.user.id)), (exceptionResult.data ?? []).map((row) => exceptionFromRow(row)), range)
+          .map((occurrence) => ({ id: occurrence.id, studentId: occurrence.studentId, startsAt: occurrence.startsAt, status: occurrence.status }));
+        const legacy = await supabase.from("lessons").select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id").gte("starts_at", rangeStart.toISOString()).lt("starts_at", rangeEnd.toISOString());
+        const legacyOccurrences = (legacy.data ?? [])
+          .filter((row) => !eventIds.includes(String(row.id)))
+          .map((row) => ({ id: String(row.id), studentId: row.student_id ? String(row.student_id) : null, startsAt: String(row.starts_at), status: (row.status as EventStatus) ?? "scheduled" }));
+        setSummaries(summarizeOccurrences(loadedStudents, [...canonicalOccurrences, ...legacyOccurrences]));
       }
       if (!cancelled) setLoading(false);
     };

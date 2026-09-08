@@ -238,24 +238,36 @@ export default function CalendarPage() {
         .lt("starts_at", new Date(rangeEndMs).toISOString())
         .order("starts_at", { ascending: true });
 
-      if (!cancelled && !eventError) {
-        setEvents((data ?? []).map((row) => eventFromRow(row, authData.user.id)));
-        const eventIds = (data ?? []).map((row) => row.id);
-        if (eventIds.length) {
-          const { data: exceptionData } = await supabase
-            .from("schedule_event_exceptions")
-            .select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee")
-            .in("event_id", eventIds);
-          if (!cancelled) setExceptions((exceptionData ?? []).map((row) => exceptionFromRow(row)));
+      const canonicalRows = eventError ? [] : (data ?? []);
+      const legacyResult = await supabase
+        .from("lessons")
+        .select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id")
+        .gte("starts_at", new Date(rangeStartMs).toISOString())
+        .lt("starts_at", new Date(rangeEndMs).toISOString())
+        .order("starts_at", { ascending: true });
+
+      if (!cancelled) {
+        if (eventError && legacyResult.error) {
+          setError(studentSchemaError ? "Apply migration 005 to enable student-calendar sync." : "Apply migration 002 to enable the calendar event store.");
+          setEvents([]);
+          setExceptions([]);
         } else {
-          setExceptions([]);
-        }
-      } else if (!cancelled) {
-        const fallback = await supabase.from("lessons").select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status").lt("starts_at", new Date(rangeEndMs).toISOString()).order("starts_at", { ascending: true });
-        if (fallback.error) setError(studentSchemaError ? "Apply migration 005 to enable student-calendar sync." : "Apply migration 002 to enable the calendar event store.");
-        else {
-          setEvents((fallback.data ?? []).map((row) => eventFromRow(row, authData.user.id)));
-          setExceptions([]);
+          const canonicalIds = new Set(canonicalRows.map((row) => String(row.id)));
+          const canonicalEvents = canonicalRows.map((row) => eventFromRow(row, authData.user.id));
+          const legacyEvents = (legacyResult.data ?? [])
+            .filter((row) => !canonicalIds.has(String(row.id)))
+            .map((row) => eventFromRow(row, authData.user.id));
+          setEvents([...canonicalEvents, ...legacyEvents].sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime()));
+
+          if (canonicalRows.length) {
+            const { data: exceptionData } = await supabase
+              .from("schedule_event_exceptions")
+              .select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee")
+              .in("event_id", canonicalRows.map((row) => row.id));
+            if (!cancelled) setExceptions((exceptionData ?? []).map((row) => exceptionFromRow(row)));
+          } else {
+            setExceptions([]);
+          }
         }
       }
       if (!cancelled) setLoading(false);
