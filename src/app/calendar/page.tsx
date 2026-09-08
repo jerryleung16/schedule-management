@@ -164,7 +164,7 @@ export default function CalendarPage() {
   const rangeEndMs = range.end.getTime();
   const occurrences = expandEvents(events, exceptions, range);
   const requestedStudent = useSyncExternalStore(subscribeToLocation, getBrowserStudentQuery, getInitialStudentQuery);
-  const effectiveStudentFilter = requestedStudent ?? studentFilter;
+  const effectiveStudentFilter = requestedStudent || studentFilter;
   const visibleOccurrences = occurrences.filter((occurrence) => effectiveStudentFilter === "all"
     || (effectiveStudentFilter === "unlinked" ? !occurrence.studentId : occurrence.studentId === effectiveStudentFilter));
   const days = Array.from({ length: view === "day" ? 1 : view === "week" ? 7 : Math.round((range.end.getTime() - range.start.getTime()) / 86400000) }, (_, index) => addDays(range.start, index));
