@@ -30,10 +30,18 @@ const weekdayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const eventTones: EventTone[] = ["blue", "coral", "teal", "yellow", "violet"];
 const initialDateKey = "2000-01-01";
 const subscribeToBrowser = () => () => {};
+const subscribeToLocation = (callback: () => void) => {
+  window.addEventListener("popstate", callback);
+  return () => window.removeEventListener("popstate", callback);
+};
 const getBrowserDateKey = () => dateKey(new Date());
 const getBrowserTimezone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
 const getInitialDateKey = () => initialDateKey;
 const getInitialTimezone = () => "Local time";
+const getBrowserStudentQuery = () => new URLSearchParams(window.location.search).get("student") ?? "";
+const getInitialStudentQuery = () => "";
+const storageKey = "daylight-lessons";
+const supabaseConfigured = Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY);
 const CALENDAR_START_MINUTES = 7 * 60;
 const CALENDAR_END_MINUTES = 22 * 60;
 const CALENDAR_INTERVAL_MINUTES = 30;
@@ -93,6 +101,16 @@ function formatTime(value: string) {
   return new Date(value).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
+function localEventFromLesson(lesson: Record<string, unknown>, date: string): ScheduleEvent {
+  return {
+    id: String(lesson.id), userId: "local", startsAt: new Date(`${date}T${String(lesson.time)}:00`).toISOString(), endsAt: new Date(`${date}T${String(lesson.end)}:00`).toISOString(),
+    timezone: getInitialTimezone(), title: String(lesson.title ?? "Lesson"), detail: String(lesson.detail ?? ""), kind: lesson.kind === "personal" ? "personal" : "lesson",
+    tone: (lesson.tone as EventTone) ?? "coral", intensity: Number(lesson.intensity ?? 2), prepMinutes: Number(lesson.prepMinutes ?? 0), travelMinutes: Number(lesson.travelMinutes ?? 0),
+    hourlyRate: Number(lesson.rate ?? 0), fixedFee: null, status: (lesson.status as EventStatus) ?? "scheduled", recurrenceWeekdays: [], recurrenceUntil: null,
+    studentId: lesson.studentId ? String(lesson.studentId) : null,
+  };
+}
+
 function occurrenceDay(occurrence: ScheduleOccurrence) {
   return dateKey(new Date(occurrence.startsAt));
 }
@@ -117,6 +135,8 @@ export default function CalendarPage() {
   const [userId, setUserId] = useState("");
   const [profileTimezone, setProfileTimezone] = useState<string | null>(null);
   const [students, setStudents] = useState<Student[]>([]);
+  const [studentDirectory, setStudentDirectory] = useState<Student[]>([]);
+  const [studentFilter, setStudentFilter] = useState("all");
   const [defaultLessonRate, setDefaultLessonRate] = useState(35);
   const [defaultTravelMinutes, setDefaultTravelMinutes] = useState(0);
   const [defaultLessonTone, setDefaultLessonTone] = useState<EventTone>("coral");
@@ -140,9 +160,16 @@ export default function CalendarPage() {
   const [deleting, setDeleting] = useState(false);
 
   const range = rangeForView(activeAnchorDate, view);
+  const rangeStartMs = range.start.getTime();
   const rangeEndMs = range.end.getTime();
   const occurrences = expandEvents(events, exceptions, range);
+  const requestedStudent = useSyncExternalStore(subscribeToLocation, getBrowserStudentQuery, getInitialStudentQuery);
+  const effectiveStudentFilter = studentFilter === "all" ? requestedStudent ?? "all" : studentFilter;
+  const visibleOccurrences = occurrences.filter((occurrence) => effectiveStudentFilter === "all"
+    || (effectiveStudentFilter === "unlinked" ? !occurrence.studentId : occurrence.studentId === effectiveStudentFilter));
   const days = Array.from({ length: view === "day" ? 1 : view === "week" ? 7 : Math.round((range.end.getTime() - range.start.getTime()) / 86400000) }, (_, index) => addDays(range.start, index));
+
+  const studentName = (studentId: string | null) => studentDirectory.find((student) => student.id === studentId)?.name ?? "No student linked";
 
   useEffect(() => {
     if (!hydrated) return;
@@ -150,6 +177,36 @@ export default function CalendarPage() {
     const load = async () => {
       setLoading(true);
       setError("");
+        if (!supabaseConfigured) {
+          const localEvents: ScheduleEvent[] = [];
+          for (let day = new Date(rangeStartMs); day < new Date(rangeEndMs); day = addDays(day, 1)) {
+            const dayKey = dateKey(day);
+            const stored = window.localStorage.getItem(`${storageKey}-${dayKey}`);
+            if (!stored) continue;
+            try {
+              const lessons = JSON.parse(stored) as Array<Record<string, unknown>>;
+              localEvents.push(...lessons.map((lesson) => localEventFromLesson(lesson, dayKey)));
+            } catch { }
+          }
+          const storedStudents = window.localStorage.getItem("daylight-students");
+          if (storedStudents) {
+            try {
+              const directory = JSON.parse(storedStudents) as Student[];
+              if (!cancelled) {
+                const normalizedDirectory = directory.map((student) => ({ ...student, status: student.status === "archived" ? "archived" as const : "active" as const }));
+                setStudentDirectory(normalizedDirectory);
+                setStudents(normalizedDirectory.filter((student) => student.status === "active"));
+              }
+            } catch { window.localStorage.removeItem("daylight-students"); }
+          }
+          if (!cancelled) {
+            setUserId("local");
+            setEvents(localEvents);
+            setExceptions([]);
+            setLoading(false);
+          }
+          return;
+        }
       const supabase = createClient();
       const { data: authData, error: authError } = await supabase.auth.getUser();
       if (cancelled) return;
@@ -166,8 +223,14 @@ export default function CalendarPage() {
         if (profile.default_lesson_tone) setDefaultLessonTone(profile.default_lesson_tone as EventTone);
         if (profile.default_personal_tone) setDefaultPersonalTone(profile.default_personal_tone as EventTone);
       }
-      const { data: studentData } = await supabase.from("students").select("id, user_id, name, email, phone, notes, status").eq("status", "active").order("name");
-      if (!cancelled) setStudents((studentData ?? []).map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" : "active" })));
+      const { data: studentData, error: studentError } = await supabase.from("students").select("id, user_id, name, email, phone, notes, status").order("name");
+      const studentSchemaError = Boolean(studentError && /students|student_id|schema cache|column/i.test(studentError.message));
+      if (studentSchemaError && !cancelled) setError("Apply migration 005 to enable student-calendar sync.");
+      if (!cancelled) {
+        const directory = (studentData ?? []).map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" as const : "active" as const }));
+        setStudentDirectory(directory);
+        setStudents(directory.filter((student) => student.status === "active"));
+      }
 
       const { data, error: eventError } = await supabase
         .from("schedule_events")
@@ -189,7 +252,7 @@ export default function CalendarPage() {
         }
       } else if (!cancelled) {
         const fallback = await supabase.from("lessons").select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status").lt("starts_at", new Date(rangeEndMs).toISOString()).order("starts_at", { ascending: true });
-        if (fallback.error) setError("Apply migration 002 to enable the calendar event store.");
+        if (fallback.error) setError(studentSchemaError ? "Apply migration 005 to enable student-calendar sync." : "Apply migration 002 to enable the calendar event store.");
         else {
           setEvents((fallback.data ?? []).map((row) => eventFromRow(row, authData.user.id)));
           setExceptions([]);
@@ -199,7 +262,7 @@ export default function CalendarPage() {
     };
     void load();
     return () => { cancelled = true; };
-  }, [activeAnchorKey, hydrated, rangeEndMs, router, view]);
+  }, [activeAnchorKey, hydrated, rangeEndMs, rangeStartMs, router, view]);
 
   const shiftRange = (amount: number) => {
     setAnchorDate(view === "month"
@@ -217,10 +280,11 @@ export default function CalendarPage() {
   const openOccurrenceEditor = (occurrence: ScheduleOccurrence) => {
     const start = new Date(occurrence.startsAt);
     const end = new Date(occurrence.endsAt);
+    const displayStudent = occurrence.kind === "lesson" ? `Student: ${studentName(occurrence.studentId)}\n` : "";
     setEditingOccurrence(occurrence);
     setForm({
       title: occurrence.title,
-      detail: occurrence.detail,
+      detail: occurrence.detail.startsWith(displayStudent) ? occurrence.detail.slice(displayStudent.length) : occurrence.detail,
       date: dateKey(start),
       starts: `${String(start.getHours()).padStart(2, "0")}:${String(start.getMinutes()).padStart(2, "0")}`,
       ends: `${String(end.getHours()).padStart(2, "0")}:${String(end.getMinutes()).padStart(2, "0")}`,
@@ -240,7 +304,6 @@ export default function CalendarPage() {
   };
 
   const persistEvent = async (scope: EditScope | null, startsAt: Date, endsAt: Date) => {
-    const supabase = createClient();
     const payload = {
       user_id: userId,
       starts_at: startsAt.toISOString(),
@@ -260,6 +323,38 @@ export default function CalendarPage() {
       recurrence_until: form.recurring && form.recurrenceUntil ? form.recurrenceUntil : null,
       student_id: form.studentId || null,
     };
+
+    if (!supabaseConfigured) {
+      if (form.recurring) {
+        setError("Recurring events are available after connecting Supabase.");
+        return;
+      }
+      const id = editingOccurrence?.id ?? crypto.randomUUID();
+      const localLesson = { id, title: payload.title, detail: payload.detail, time: form.starts, end: form.ends, kind: form.kind, tone: form.tone, travelMinutes: form.travelMinutes, rate: form.hourlyRate, status: form.status, studentId: payload.student_id };
+      const oldDate = editingOccurrence ? dateKey(new Date(editingOccurrence.startsAt)) : null;
+      if (oldDate) {
+        const oldStored = window.localStorage.getItem(`${storageKey}-${oldDate}`);
+        if (oldStored) {
+          try { window.localStorage.setItem(`${storageKey}-${oldDate}`, JSON.stringify((JSON.parse(oldStored) as Array<Record<string, unknown>>).filter((lesson) => String(lesson.id) !== id))); } catch { }
+        }
+      }
+      const targetKey = dateKey(startsAt);
+      const targetStored = window.localStorage.getItem(`${storageKey}-${targetKey}`);
+      let targetLessons: Array<Record<string, unknown>> = [];
+      if (targetStored) {
+        try { targetLessons = JSON.parse(targetStored) as Array<Record<string, unknown>>; } catch { }
+      }
+      window.localStorage.setItem(`${storageKey}-${targetKey}`, JSON.stringify([...targetLessons.filter((lesson) => String(lesson.id) !== id), localLesson]));
+      setEvents((current) => [...current.filter((item) => item.id !== id), localEventFromLesson(localLesson, targetKey)]);
+      setNotice(editingOccurrence ? "Event updated." : "Event added to your calendar.");
+      setEditorOpen(false);
+      setEditScopeOpen(false);
+      setEditingOccurrence(null);
+      setAnchorDate(dateFromKey(form.date));
+      return;
+    }
+
+    const supabase = createClient();
 
     if (editingOccurrence && scope === "occurrence") {
       const { data, error: exceptionError } = await supabase.from("schedule_event_exceptions").upsert({
@@ -411,10 +506,11 @@ export default function CalendarPage() {
     await persistEvent(scope, startsAt, endsAt);
   };
 
-  const occurrencesForDay = (day: Date) => occurrences.filter((item) => occurrenceDay(item) === dateKey(day));
+  const occurrencesForDay = (day: Date) => visibleOccurrences.filter((item) => occurrenceDay(item) === dateKey(day));
 
   const openOccurrenceDetails = (occurrence: ScheduleOccurrence) => {
-    setSelectedOccurrence(occurrence);
+    const displayStudent = occurrence.kind === "lesson" ? `Student: ${studentName(occurrence.studentId)}\n` : "";
+    setSelectedOccurrence({ ...occurrence, detail: displayStudent + occurrence.detail });
     setNotice("");
     setDetailsOpen(true);
   };
@@ -434,6 +530,24 @@ export default function CalendarPage() {
     if (!selectedOccurrence) return;
     setDeleting(true);
     setError("");
+    if (!supabaseConfigured) {
+      const dayKey = dateKey(new Date(selectedOccurrence.startsAt));
+      const stored = window.localStorage.getItem(`${storageKey}-${dayKey}`);
+      if (stored) {
+        try {
+          const remaining = (JSON.parse(stored) as Array<Record<string, unknown>>).filter((lesson) => String(lesson.id) !== selectedOccurrence.id);
+          window.localStorage.setItem(`${storageKey}-${dayKey}`, JSON.stringify(remaining));
+        } catch { }
+      }
+      setEvents((current) => current.filter((event) => event.id !== selectedOccurrence.id));
+      setDeleting(false);
+      setDeleteScopeOpen(false);
+      setDeleteConfirmOpen(false);
+      setDetailsOpen(false);
+      setSelectedOccurrence(null);
+      setNotice("Event deleted.");
+      return;
+    }
     const supabase = createClient();
     let deleteError = null;
     if (!selectedOccurrence.isRecurring || scope === "all") {
@@ -480,9 +594,9 @@ export default function CalendarPage() {
         <section className="calendar-panel">
           <div className="calendar-toolbar">
             <div className="calendar-toolbar-left"><button className="round-button" aria-label="Previous range" onClick={() => shiftRange(-1)}><ChevronLeft size={17} /></button><button className="round-button" aria-label="Next range" onClick={() => shiftRange(1)}><ChevronRight size={17} /></button><button className="today-button" onClick={() => setAnchorDate(dateFromKey(todayKey))}>Today</button><strong>{formatRangeLabel(activeAnchorDate, view)}</strong></div>
-            <div className="view-toggle"><button className={view === "day" ? "view-active" : ""} onClick={() => setView("day")}>Day</button><button className={view === "week" ? "view-active" : ""} onClick={() => setView("week")}>Week</button><button className={view === "month" ? "view-active" : ""} onClick={() => setView("month")}>Month</button></div>
+              <div className="view-toggle"><button className={view === "day" ? "view-active" : ""} onClick={() => setView("day")}>Day</button><button className={view === "week" ? "view-active" : ""} onClick={() => setView("week")}>Week</button><button className={view === "month" ? "view-active" : ""} onClick={() => setView("month")}>Month</button></div><label className="calendar-student-filter"><span>Student</span><select value={effectiveStudentFilter} onChange={(event) => { const value = event.target.value; setStudentFilter(value); if (value === "all" && requestedStudent) router.replace("/calendar"); }}><option value="all">All students</option><option value="unlinked">Unlinked</option>{studentDirectory.map((student) => <option value={student.id} key={student.id}>{student.name}{student.status === "archived" ? " (archived)" : ""}</option>)}</select></label>
           </div>
-          {loading ? <div className="calendar-empty">Loading your calendar...</div> : view === "day" || view === "week" ? <div className={`week-calendar ${view === "day" ? "day-calendar" : ""}`}><div className="week-gutter" /><div className="week-day-heads">{days.map((day) => <div className="calendar-day-head" key={dateKey(day)}><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>)}</div><div className="week-times">{calendarTimeLabels.map((label) => <span key={label}>{label}</span>)}</div><div className="week-grid">{days.map((day) => { const dayEvents = occurrencesForDay(day); return <div className="week-day-column" key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="calendar-hour-lines" />{dayEvents.map((item, index) => <button className={`calendar-event event-${item.tone}`} key={item.occurrenceKey} style={eventStyle(item, index, Math.max(1, dayEvents.length))} onClick={() => openOccurrenceDetails(item)}><strong>{item.title}</strong><span>{formatTime(item.startsAt)} · {item.kind === "lesson" ? `$${item.fixedFee ?? item.hourlyRate}/h` : "Personal"}</span></button>)}</div>; })}</div></div> : <div className="month-calendar">{days.map((day) => { const dayEvents = occurrencesForDay(day); const outside = day.getMonth() !== activeAnchorDate.getMonth(); return <div className={`month-day ${outside ? "month-day-outside" : ""}`} key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="month-day-number"><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>{dayEvents.slice(0, 4).map((item) => <button className={`month-event event-${item.tone}`} key={item.occurrenceKey} onClick={() => openOccurrenceDetails(item)}>{formatTime(item.startsAt)} {item.title}</button>)}{dayEvents.length > 4 && <span className="more-events">+{dayEvents.length - 4} more</span>}</div>; })}</div>}
+          {loading ? <div className="calendar-empty">Loading your calendar...</div> : view === "day" || view === "week" ? <div className={`week-calendar ${view === "day" ? "day-calendar" : ""}`}><div className="week-gutter" /><div className="week-day-heads">{days.map((day) => <div className="calendar-day-head" key={dateKey(day)}><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>)}</div><div className="week-times">{calendarTimeLabels.map((label) => <span key={label}>{label}</span>)}</div><div className="week-grid">{days.map((day) => { const dayEvents = occurrencesForDay(day); return <div className="week-day-column" key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="calendar-hour-lines" />{dayEvents.map((item, index) => <button className={`calendar-event event-${item.tone}`} key={item.occurrenceKey} style={eventStyle(item, index, Math.max(1, dayEvents.length))} onClick={() => openOccurrenceDetails(item)}><strong>{item.title}</strong><span>{formatTime(item.startsAt)} · {item.kind === "lesson" ? `${studentName(item.studentId)} · $${item.fixedFee ?? item.hourlyRate}/h` : "Personal"}</span></button>)}</div>; })}</div></div> : <div className="month-calendar">{days.map((day) => { const dayEvents = occurrencesForDay(day); const outside = day.getMonth() !== activeAnchorDate.getMonth(); return <div className={`month-day ${outside ? "month-day-outside" : ""}`} key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="month-day-number"><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>{dayEvents.slice(0, 4).map((item) => <button className={`month-event event-${item.tone}`} key={item.occurrenceKey} onClick={() => openOccurrenceDetails(item)}>{formatTime(item.startsAt)} {item.title}{item.kind === "lesson" ? ` · ${studentName(item.studentId)}` : ""}</button>)}{dayEvents.length > 4 && <span className="more-events">+{dayEvents.length - 4} more</span>}</div>; })}</div>}
         </section>
         <p className="calendar-footnote"><Clock3 size={14} /> {timezone} · Double-click a day to add an event.</p>
       </div>

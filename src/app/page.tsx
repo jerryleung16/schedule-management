@@ -28,7 +28,7 @@ import { createClient } from "@/lib/supabase/client";
 import { availabilityConflicts, formatWeeklyAvailabilityMessage, lessonHours, normalizeWeeklyAvailability, occupiedAvailabilityByWeekday, practicalFreeSlots, slotConflicts, staminaState, validateWeeklyAvailability } from "@/lib/schedule/availability";
 import { addDays, dateFromKey, dateKey, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
-import type { EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, WeeklyAvailability } from "@/lib/schedule/types";
+import type { EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, Student, WeeklyAvailability } from "@/lib/schedule/types";
 
 type IconComponent = typeof LayoutDashboard;
 
@@ -44,6 +44,7 @@ type Lesson = {
   prepMinutes: number;
   travelMinutes: number;
   rate: number;
+  studentId: string | null;
   status: EventStatus;
 };
 
@@ -155,6 +156,7 @@ function lessonFromRow(row: {
   prep_minutes: number;
   travel_minutes: number;
   hourly_rate: number;
+  student_id?: string | null;
   status: EventStatus;
 }): Lesson {
   const start = new Date(row.starts_at);
@@ -171,6 +173,7 @@ function lessonFromRow(row: {
     prepMinutes: row.prep_minutes,
     travelMinutes: row.travel_minutes,
     rate: Number(row.hourly_rate),
+    studentId: row.student_id ? String(row.student_id) : null,
     status: row.status,
   };
 }
@@ -189,6 +192,7 @@ function lessonToRow(lesson: Lesson, userId: string, date: string) {
     prep_minutes: lesson.prepMinutes,
     travel_minutes: lesson.travelMinutes,
     hourly_rate: lesson.rate,
+    student_id: lesson.studentId,
     status: lesson.status,
     updated_at: new Date().toISOString(),
   };
@@ -209,6 +213,7 @@ function lessonToScheduleRow(lesson: Lesson, userId: string, date: string) {
     prep_minutes: lesson.prepMinutes,
     travel_minutes: lesson.travelMinutes,
     hourly_rate: lesson.rate,
+    student_id: lesson.studentId,
     fixed_fee: null,
     status: lesson.status,
     recurrence_weekdays: [],
@@ -261,7 +266,7 @@ function localLessonOccurrence(lesson: Lesson, date: string): ScheduleOccurrence
     status: lesson.status,
     recurrenceWeekdays: [],
     recurrenceUntil: null,
-    studentId: null,
+    studentId: lesson.studentId,
     occurrenceKey: `${lesson.id}:${date}`,
     originalStartsAt: startsAt.toISOString(),
     isRecurring: false,
@@ -300,6 +305,7 @@ export default function Home() {
   const [defaultLessonRate, setDefaultLessonRate] = useState(35);
   const [defaultTravelMinutes, setDefaultTravelMinutes] = useState(0);
   const [defaultLessonTone, setDefaultLessonTone] = useState<EventTone>("coral");
+    const [students, setStudents] = useState<Student[]>([]);
   const [dataError, setDataError] = useState("");
   const [notice, setNotice] = useState("");
   const [activeNav, setActiveNav] = useState("Overview");
@@ -329,6 +335,10 @@ export default function Home() {
       if (!supabaseConfigured) {
         const savedLessons = window.localStorage.getItem(`${storageKey}-${selectedDate}`);
         const savedSettings = window.localStorage.getItem("daylight-settings");
+                const savedStudents = window.localStorage.getItem("daylight-students");
+                if (savedStudents) {
+                  try { setStudents(JSON.parse(savedStudents) as Student[]); } catch { window.localStorage.removeItem("daylight-students"); }
+                }
         if (savedSettings) {
           try {
             const settings = JSON.parse(savedSettings) as { defaultLessonRate?: number; defaultTravelMinutes?: number; defaultLessonTone?: EventTone };
@@ -400,13 +410,16 @@ export default function Home() {
       if (profileData?.default_lesson_rate !== null && profileData?.default_lesson_rate !== undefined) setDefaultLessonRate(Number(profileData.default_lesson_rate));
       if (profileData?.default_travel_minutes !== null && profileData?.default_travel_minutes !== undefined) setDefaultTravelMinutes(Number(profileData.default_travel_minutes));
       if (profileData?.default_lesson_tone) setDefaultLessonTone(profileData.default_lesson_tone as EventTone);
+      const { data: studentData, error: studentError } = await supabase.from("students").select("id, user_id, name, email, phone, notes, status").eq("status", "active").order("name");
+      if (studentError && /students|student_id|schema cache|column/i.test(studentError.message)) setDataError("Apply migration 005 to enable student-calendar sync.");
+      if (studentData) setStudents(studentData.map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" : "active" })));
       const selectedMonth = new Date(`${selectedDate}T12:00:00`);
       const monthStart = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), 1, 0);
       const monthEnd = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() + 1, 1, 0);
       const monthRange = { start: monthStart, end: monthEnd };
       const canonicalMonth = await supabase
         .from("schedule_events")
-        .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until")
+        .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id")
         .lt("starts_at", monthEnd.toISOString());
       if (!canonicalMonth.error) {
         const monthEvents = (canonicalMonth.data ?? []).map((row) => scheduleEventFromRow(row, userData.user.id));
@@ -429,13 +442,13 @@ export default function Home() {
       const weekEnd = weekRange.end;
       const canonicalWeek = await supabase
         .from("schedule_events")
-        .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until")
+        .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id")
         .lt("starts_at", weekEnd.toISOString())
         .order("starts_at", { ascending: true });
       let weekData = canonicalWeek.data as unknown as Record<string, unknown>[] | null;
       let weekError = canonicalWeek.error;
       if (weekError) {
-        const fallbackWeek = await supabase.from("lessons").select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status").gte("starts_at", weekStart.toISOString()).lt("starts_at", weekEnd.toISOString());
+        const fallbackWeek = await supabase.from("lessons").select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id").gte("starts_at", weekStart.toISOString()).lt("starts_at", weekEnd.toISOString());
         weekData = fallbackWeek.data as unknown as Record<string, unknown>[] | null;
         weekError = fallbackWeek.error;
       }
@@ -453,14 +466,14 @@ export default function Home() {
       }
       let { data, error } = await supabase
         .from("schedule_events")
-        .select("id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status")
+        .select("id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id")
         .gte("starts_at", new Date(`${selectedDate}T00:00:00`).toISOString())
         .lt("starts_at", new Date(`${selectedDate}T23:59:59`).toISOString())
         .order("starts_at", { ascending: true });
       if (error) {
         const fallback = await supabase
           .from("lessons")
-          .select("id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status")
+          .select("id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id")
           .gte("starts_at", new Date(`${selectedDate}T00:00:00`).toISOString())
           .lt("starts_at", new Date(`${selectedDate}T23:59:59`).toISOString())
           .order("starts_at", { ascending: true });
@@ -677,6 +690,7 @@ export default function Home() {
       travelMinutes: defaultTravelMinutes,
       rate: defaultLessonRate,
       status: "scheduled",
+      studentId: null,
     });
     setLessonFormError("");
     setLessonModalOpen(true);
@@ -704,17 +718,18 @@ export default function Home() {
   const saveLesson = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!editingLesson) return;
-    if (!editingLesson.title.trim()) {
+    const lesson = editingLesson.kind === "lesson" ? editingLesson : { ...editingLesson, studentId: null };
+    if (!lesson.title.trim()) {
       setLessonFormError("Give this block a name first.");
       return;
     }
-    if (minutesFromTime(editingLesson.end) <= minutesFromTime(editingLesson.time)) {
+    if (minutesFromTime(lesson.end) <= minutesFromTime(lesson.time)) {
       setLessonFormError("End time must be after the start time.");
       return;
     }
-    const proposedStart = new Date(`${lessonFormDate}T${editingLesson.time}:00`);
-    const proposedEnd = new Date(`${lessonFormDate}T${editingLesson.end}:00`);
-    const editingExisting = lessons.some((lesson) => lesson.id === editingLesson.id);
+    const proposedStart = new Date(`${lessonFormDate}T${lesson.time}:00`);
+    const proposedEnd = new Date(`${lessonFormDate}T${lesson.end}:00`);
+    const editingExisting = lessons.some((item) => item.id === lesson.id);
     if (!editingExisting && slotConflicts(proposedStart, proposedEnd, weeklyOccurrences)) {
       setLessonFormError("That time overlaps an existing event.");
       return;
@@ -726,9 +741,9 @@ export default function Home() {
       }
       setIsCloudSaving(true);
       const supabase = createClient();
-      const { error: scheduleError } = await supabase.from("schedule_events").upsert(lessonToScheduleRow(editingLesson, userId, lessonFormDate));
+      const { error: scheduleError } = await supabase.from("schedule_events").upsert(lessonToScheduleRow(lesson, userId, lessonFormDate));
       const error = scheduleError
-        ? (await supabase.from("lessons").upsert(lessonToRow(editingLesson, userId, lessonFormDate))).error
+        ? (await supabase.from("lessons").upsert(lessonToRow(lesson, userId, lessonFormDate))).error
         : null;
       setIsCloudSaving(false);
       if (error) {
@@ -737,9 +752,9 @@ export default function Home() {
       }
     }
     setSelectedDate(lessonFormDate);
-    setLessons((current) => current.some((lesson) => lesson.id === editingLesson.id)
-      ? current.map((lesson) => lesson.id === editingLesson.id ? editingLesson : lesson)
-      : [...current, editingLesson]);
+    setLessons((current) => current.some((item) => item.id === lesson.id)
+      ? current.map((item) => item.id === lesson.id ? lesson : item)
+      : [...current, lesson]);
     setLessonModalOpen(false);
     setEditingLesson(null);
   };
@@ -900,7 +915,7 @@ export default function Home() {
       {lessonDetailsOpen && editingLesson && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setLessonDetailsOpen(false); }}>
         <section className="lesson-modal event-details-modal" role="dialog" aria-modal="true" aria-labelledby="lesson-details-title">
           <div className="modal-heading"><div><p className="section-kicker">Schedule block</p><h2 id="lesson-details-title">{editingLesson.title}</h2><p className="calendar-subtitle">{new Date(`${lessonFormDate}T12:00:00`).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p></div><button className="modal-close" aria-label="Close schedule details" onClick={() => setLessonDetailsOpen(false)}><X size={18} /></button></div>
-          <div className="event-detail-grid"><div><span>Time</span><strong>{editingLesson.time}–{editingLesson.end}</strong></div><div><span>Type</span><strong>{editingLesson.kind === "lesson" ? "Lesson" : "Personal"}</strong></div><div><span>Rate</span><strong>{editingLesson.kind === "lesson" ? `$${editingLesson.rate}/h` : "Not applicable"}</strong></div><div><span>Travel</span><strong>{editingLesson.travelMinutes} minutes</strong></div><div><span>Status</span><strong>{editingLesson.status}</strong></div>{editingLesson.detail && <div className="event-detail-wide"><span>Notes</span><strong>{editingLesson.detail}</strong></div>}</div>
+          <div className="event-detail-grid"><div><span>Time</span><strong>{editingLesson.time}–{editingLesson.end}</strong></div><div><span>Type</span><strong>{editingLesson.kind === "lesson" ? "Lesson" : "Personal"}</strong></div>{editingLesson.kind === "lesson" && <div><span>Student</span><strong>{students.find((student) => student.id === editingLesson.studentId)?.name ?? "No student linked"}</strong></div>}<div><span>Rate</span><strong>{editingLesson.kind === "lesson" ? `$${editingLesson.rate}/h` : "Not applicable"}</strong></div><div><span>Travel</span><strong>{editingLesson.travelMinutes} minutes</strong></div><div><span>Status</span><strong>{editingLesson.status}</strong></div>{editingLesson.detail && <div className="event-detail-wide"><span>Notes</span><strong>{editingLesson.detail}</strong></div>}</div>
           <div className="modal-footer"><button type="button" className="delete-button" onClick={requestLessonDelete}>Delete block</button><span /><button type="button" className="secondary-button" onClick={() => { setLessonDetailsOpen(false); openLessonEditor(editingLesson); }}>Edit</button></div>
         </section>
       </div>}
@@ -921,7 +936,8 @@ export default function Home() {
               <label className="form-field"><span>Starts</span><input type="time" value={editingLesson.time} onChange={(event) => setEditingLesson({ ...editingLesson, time: event.target.value })} /></label>
               <label className="form-field"><span>Ends</span><input type="time" value={editingLesson.end} onChange={(event) => setEditingLesson({ ...editingLesson, end: event.target.value })} /></label>
               <label className="form-field form-field-wide"><span>Notes</span><input value={editingLesson.detail} onChange={(event) => setEditingLesson({ ...editingLesson, detail: event.target.value })} placeholder="What is this block for?" /></label>
-              <label className="form-field"><span>Type</span><select value={editingLesson.kind} onChange={(event) => { const kind = event.target.value as Lesson["kind"]; setEditingLesson({ ...editingLesson, kind, tone: kind === "lesson" ? "coral" : "teal" }); }}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label>
+              <label className="form-field"><span>Type</span><select value={editingLesson.kind} onChange={(event) => { const kind = event.target.value as Lesson["kind"]; setEditingLesson({ ...editingLesson, kind, tone: kind === "lesson" ? defaultLessonTone : "teal", studentId: kind === "lesson" ? editingLesson.studentId : null }); }}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label>
+              <label className="form-field"><span>Student</span><select value={editingLesson.studentId ?? ""} disabled={editingLesson.kind === "personal"} onChange={(event) => setEditingLesson({ ...editingLesson, studentId: event.target.value || null })}><option value="">No student linked</option>{students.map((student) => <option value={student.id} key={student.id}>{student.name}</option>)}</select></label>
               <label className="form-field"><span>Travel minutes</span><input type="number" min="0" value={editingLesson.travelMinutes} onChange={(event) => setEditingLesson({ ...editingLesson, travelMinutes: Number(event.target.value) })} /></label>
               <label className="form-field"><span>Hourly rate</span><input type="number" min="0" step="0.5" value={editingLesson.rate} onChange={(event) => setEditingLesson({ ...editingLesson, rate: Number(event.target.value) })} /></label>
               <div className="tone-picker form-field-wide"><span className="form-field-label">Color</span><div>{eventTones.map((tone) => <button type="button" key={tone} aria-label={`Use ${tone} color`} className={`tone-swatch tone-${tone} ${editingLesson.tone === tone ? "tone-selected" : ""}`} onClick={() => setEditingLesson({ ...editingLesson, tone })}></button>)}</div></div>
