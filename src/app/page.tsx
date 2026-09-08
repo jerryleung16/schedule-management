@@ -116,6 +116,19 @@ function minutesFromTime(value: string) {
   return hours * 60 + minutes;
 }
 
+const HOMEPAGE_SCHEDULE_START_MINUTES = 8 * 60;
+const HOMEPAGE_SCHEDULE_END_MINUTES = 22 * 60;
+const HOMEPAGE_SCHEDULE_DURATION_MINUTES = HOMEPAGE_SCHEDULE_END_MINUTES - HOMEPAGE_SCHEDULE_START_MINUTES;
+
+function homepageScheduleStyle(starts: string, ends: string) {
+  const visibleStart = Math.max(HOMEPAGE_SCHEDULE_START_MINUTES, minutesFromTime(starts));
+  const visibleEnd = Math.min(HOMEPAGE_SCHEDULE_END_MINUTES, minutesFromTime(ends));
+  return {
+    top: `${((visibleStart - HOMEPAGE_SCHEDULE_START_MINUTES) / HOMEPAGE_SCHEDULE_DURATION_MINUTES) * 100}%`,
+    height: `${((visibleEnd - visibleStart) / HOMEPAGE_SCHEDULE_DURATION_MINUTES) * 100}%`,
+  };
+}
+
 function formatResult(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
 }
@@ -828,11 +841,11 @@ export default function Home() {
                 <div className="panel-actions"><button className="round-button" aria-label="Previous day" onClick={() => changeDate(-1)}><ChevronLeft size={17} /></button><button className="round-button" aria-label="Next day" onClick={() => changeDate(1)}><ChevronRight size={17} /></button><button className="text-button" onClick={goToToday}>Today <ChevronDown size={14} /></button></div>
               </div>
               <div className="schedule-body">
-                <div className="time-column"><span>08:00</span><span>10:00</span><span>12:00</span><span>14:00</span><span>16:00</span><span>18:00</span></div>
+                <div className="time-column"><span>08:00</span><span>10:00</span><span>12:00</span><span>14:00</span><span>16:00</span><span>18:00</span><span>20:00</span><span>22:00</span></div>
                 <div className="schedule-track">
-                  <div className="schedule-line line-1" /><div className="schedule-line line-2" /><div className="schedule-line line-3" /><div className="schedule-line line-4" /><div className="schedule-line line-5" />
+                  <div className="schedule-line line-1" /><div className="schedule-line line-2" /><div className="schedule-line line-3" /><div className="schedule-line line-4" /><div className="schedule-line line-5" /><div className="schedule-line line-6" /><div className="schedule-line line-7" />
                   <div className="now-line"><span>NOW</span></div>
-                  {lessons.map((item) => <button className={`schedule-event event-${item.tone}`} key={item.id} onClick={() => openLesson(item)} style={{ top: `${((minutesFromTime(item.time) - 480) / 600) * 100}%`, height: `${((minutesFromTime(item.end) - minutesFromTime(item.time)) / 600) * 100}%` }}>
+                  {lessons.filter((item) => minutesFromTime(item.end) > HOMEPAGE_SCHEDULE_START_MINUTES && minutesFromTime(item.time) < HOMEPAGE_SCHEDULE_END_MINUTES).map((item) => <button className={`schedule-event event-${item.tone}`} key={item.id} onClick={() => openLesson(item)} style={homepageScheduleStyle(item.time, item.end)}>
                     <strong>{item.title}</strong><span>{item.detail}</span><small>{item.time} – {item.end}</small>
                   </button>)}
                 </div>
