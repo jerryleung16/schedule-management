@@ -236,6 +236,7 @@ function scheduleEventFromRow(row: Record<string, unknown>, userId: string): Sch
     status: (row.status as EventStatus) ?? "scheduled",
     recurrenceWeekdays: Array.isArray(row.recurrence_weekdays) ? row.recurrence_weekdays.map(Number) : [],
     recurrenceUntil: row.recurrence_until ? String(row.recurrence_until) : null,
+    studentId: row.student_id ? String(row.student_id) : null,
   };
 }
 
@@ -260,6 +261,7 @@ function localLessonOccurrence(lesson: Lesson, date: string): ScheduleOccurrence
     status: lesson.status,
     recurrenceWeekdays: [],
     recurrenceUntil: null,
+    studentId: null,
     occurrenceKey: `${lesson.id}:${date}`,
     originalStartsAt: startsAt.toISOString(),
     isRecurring: false,
@@ -295,6 +297,9 @@ export default function Home() {
   const [userId, setUserId] = useState("");
   const [userEmail, setUserEmail] = useState("");
   const [displayName, setDisplayName] = useState("Your day");
+  const [defaultLessonRate, setDefaultLessonRate] = useState(35);
+  const [defaultTravelMinutes, setDefaultTravelMinutes] = useState(0);
+  const [defaultLessonTone, setDefaultLessonTone] = useState<EventTone>("coral");
   const [dataError, setDataError] = useState("");
   const [notice, setNotice] = useState("");
   const [activeNav, setActiveNav] = useState("Overview");
@@ -323,6 +328,15 @@ export default function Home() {
       setDataError("");
       if (!supabaseConfigured) {
         const savedLessons = window.localStorage.getItem(`${storageKey}-${selectedDate}`);
+        const savedSettings = window.localStorage.getItem("daylight-settings");
+        if (savedSettings) {
+          try {
+            const settings = JSON.parse(savedSettings) as { defaultLessonRate?: number; defaultTravelMinutes?: number; defaultLessonTone?: EventTone };
+            if (settings.defaultLessonRate !== undefined) setDefaultLessonRate(settings.defaultLessonRate);
+            if (settings.defaultTravelMinutes !== undefined) setDefaultTravelMinutes(settings.defaultTravelMinutes);
+            if (settings.defaultLessonTone) setDefaultLessonTone(settings.defaultLessonTone);
+          } catch { window.localStorage.removeItem("daylight-settings"); }
+        }
         let selectedLessons: Lesson[] = [];
         if (savedLessons) {
           try {
@@ -381,8 +395,11 @@ export default function Home() {
 
       setUserId(userData.user.id);
       setUserEmail(userData.user.email ?? "");
-      const { data: profileData } = await supabase.from("profiles").select("display_name").eq("id", userData.user.id).maybeSingle();
+      const { data: profileData } = await supabase.from("profiles").select("display_name, default_lesson_rate, default_travel_minutes, default_lesson_tone").eq("id", userData.user.id).maybeSingle();
       if (profileData?.display_name) setDisplayName(profileData.display_name);
+      if (profileData?.default_lesson_rate !== null && profileData?.default_lesson_rate !== undefined) setDefaultLessonRate(Number(profileData.default_lesson_rate));
+      if (profileData?.default_travel_minutes !== null && profileData?.default_travel_minutes !== undefined) setDefaultTravelMinutes(Number(profileData.default_travel_minutes));
+      if (profileData?.default_lesson_tone) setDefaultLessonTone(profileData.default_lesson_tone as EventTone);
       const selectedMonth = new Date(`${selectedDate}T12:00:00`);
       const monthStart = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), 1, 0);
       const monthEnd = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() + 1, 1, 0);
@@ -591,6 +608,8 @@ export default function Home() {
     } else if (label === "Calculator") {
       focusSection(label, calculatorRef.current);
       window.setTimeout(() => calculatorRef.current?.querySelector<HTMLButtonElement>(".calc-key")?.focus(), 250);
+    } else if (label === "Students") {
+      router.push("/students");
     } else {
       setActiveNav(label);
       setMobileMenuOpen(false);
@@ -652,11 +671,11 @@ export default function Home() {
       title: "",
       detail: "",
       kind: "lesson",
-      tone: "coral",
+      tone: defaultLessonTone,
       intensity: 2,
       prepMinutes: 15,
-      travelMinutes: 0,
-      rate: 35,
+      travelMinutes: defaultTravelMinutes,
+      rate: defaultLessonRate,
       status: "scheduled",
     });
     setLessonFormError("");
@@ -791,7 +810,7 @@ export default function Home() {
             <div className="tip-icon"><CircleHelp size={17} /></div>
             <div><strong>Protect your energy</strong><span>Keep an eye on your weekly load.</span></div>
           </div>
-          <button className="nav-item" onClick={() => { setMobileMenuOpen(false); showNotice("Settings will be available in a future update."); }}><Settings2 size={18} /><span>Settings</span></button>
+          <button className="nav-item" onClick={() => { setMobileMenuOpen(false); router.push("/settings"); }}><Settings2 size={18} /><span>Settings</span></button>
           {supabaseConfigured && <button className="nav-item" onClick={signOut}><LogOut size={18} /><span>Sign out</span></button>}
           <div className="sidebar-footer"><span className="status-dot" /> {isCloudSaving ? "Saving changes..." : supabaseConfigured ? "Synced to cloud" : "Saved in this browser"} <span>v0.2</span></div>
         </div>

@@ -7,7 +7,7 @@ import { createClient } from "@/lib/supabase/client";
 import { slotConflicts } from "@/lib/schedule/availability";
 import { addDays, dateKey, dateFromKey, formatRangeLabel, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
-import type { CalendarView, DeleteScope, EditScope, EventKind, EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence } from "@/lib/schedule/types";
+import type { CalendarView, DeleteScope, EditScope, EventKind, EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, Student } from "@/lib/schedule/types";
 
 type EventForm = {
   title: string;
@@ -19,6 +19,7 @@ type EventForm = {
   tone: EventTone;
   travelMinutes: number;
   hourlyRate: number;
+  studentId: string;
   status: EventStatus;
   recurring: boolean;
   weekdays: number[];
@@ -57,6 +58,7 @@ function emptyForm(date = initialDateKey): EventForm {
     tone: "coral",
     travelMinutes: 0,
     hourlyRate: 35,
+    studentId: "",
     status: "scheduled",
     recurring: false,
     weekdays: [weekday],
@@ -83,6 +85,7 @@ function eventFromRow(row: Record<string, unknown>, userId: string): ScheduleEve
     status: (row.status as EventStatus) ?? "scheduled",
     recurrenceWeekdays: Array.isArray(row.recurrence_weekdays) ? row.recurrence_weekdays.map(Number) : [],
     recurrenceUntil: row.recurrence_until ? String(row.recurrence_until) : null,
+    studentId: row.student_id ? String(row.student_id) : null,
   };
 }
 
@@ -113,6 +116,11 @@ export default function CalendarPage() {
   const [exceptions, setExceptions] = useState<ScheduleEventException[]>([]);
   const [userId, setUserId] = useState("");
   const [profileTimezone, setProfileTimezone] = useState<string | null>(null);
+  const [students, setStudents] = useState<Student[]>([]);
+  const [defaultLessonRate, setDefaultLessonRate] = useState(35);
+  const [defaultTravelMinutes, setDefaultTravelMinutes] = useState(0);
+  const [defaultLessonTone, setDefaultLessonTone] = useState<EventTone>("coral");
+  const [defaultPersonalTone, setDefaultPersonalTone] = useState<EventTone>("teal");
   const browserTimezone = useSyncExternalStore(subscribeToBrowser, getBrowserTimezone, getInitialTimezone);
   const timezone = profileTimezone ?? browserTimezone;
   const hydrated = todayKey !== initialDateKey;
@@ -150,12 +158,20 @@ export default function CalendarPage() {
         return;
       }
       setUserId(authData.user.id);
-      const { data: profile } = await supabase.from("profiles").select("timezone").eq("id", authData.user.id).maybeSingle();
-      if (!cancelled && profile?.timezone) setProfileTimezone(profile.timezone);
+      const { data: profile } = await supabase.from("profiles").select("timezone, default_lesson_rate, default_travel_minutes, default_lesson_tone, default_personal_tone").eq("id", authData.user.id).maybeSingle();
+      if (!cancelled && profile) {
+        if (profile.timezone) setProfileTimezone(profile.timezone);
+        if (profile.default_lesson_rate !== null && profile.default_lesson_rate !== undefined) setDefaultLessonRate(Number(profile.default_lesson_rate));
+        if (profile.default_travel_minutes !== null && profile.default_travel_minutes !== undefined) setDefaultTravelMinutes(Number(profile.default_travel_minutes));
+        if (profile.default_lesson_tone) setDefaultLessonTone(profile.default_lesson_tone as EventTone);
+        if (profile.default_personal_tone) setDefaultPersonalTone(profile.default_personal_tone as EventTone);
+      }
+      const { data: studentData } = await supabase.from("students").select("id, user_id, name, email, phone, notes, status").eq("status", "active").order("name");
+      if (!cancelled) setStudents((studentData ?? []).map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" : "active" })));
 
       const { data, error: eventError } = await supabase
         .from("schedule_events")
-        .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until")
+        .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id")
         .lt("starts_at", new Date(rangeEndMs).toISOString())
         .order("starts_at", { ascending: true });
 
@@ -193,7 +209,7 @@ export default function CalendarPage() {
 
   const openEditor = (date = dateKey(activeAnchorDate)) => {
     setEditingOccurrence(null);
-    setForm(emptyForm(date));
+    setForm({ ...emptyForm(date), tone: defaultLessonTone, travelMinutes: defaultTravelMinutes, hourlyRate: defaultLessonRate });
     setNotice("");
     setEditorOpen(true);
   };
@@ -216,6 +232,7 @@ export default function CalendarPage() {
       recurring: occurrence.isRecurring,
       weekdays: occurrence.recurrenceWeekdays,
       recurrenceUntil: occurrence.recurrenceUntil ?? "",
+      studentId: occurrence.studentId ?? "",
     });
     setNotice("");
     setDetailsOpen(false);
@@ -241,6 +258,7 @@ export default function CalendarPage() {
       status: form.status,
       recurrence_weekdays: form.recurring ? form.weekdays : [],
       recurrence_until: form.recurring && form.recurrenceUntil ? form.recurrenceUntil : null,
+      student_id: form.studentId || null,
     };
 
     if (editingOccurrence && scope === "occurrence") {
@@ -256,7 +274,7 @@ export default function CalendarPage() {
         travel_minutes: payload.travel_minutes,
         hourly_rate: payload.hourly_rate,
         fixed_fee: payload.fixed_fee,
-        status: payload.status,
+          status: payload.status,
       }, { onConflict: "event_id,original_starts_at" }).select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").single();
       if (exceptionError) {
         setError(exceptionError.message || "Apply migration 004 to edit one recurring occurrence.");
@@ -285,6 +303,7 @@ export default function CalendarPage() {
           travel_minutes: payload.travel_minutes,
           hourly_rate: payload.hourly_rate,
           status: payload.status === "completed" ? "completed" : "scheduled",
+          student_id: payload.student_id,
         }).eq("id", editingOccurrence.id)).error
         : null;
       if (error) {
@@ -304,7 +323,8 @@ export default function CalendarPage() {
         hourly_rate: payload.hourly_rate,
         status: payload.status,
         recurrence_weekdays: payload.recurrence_weekdays,
-        recurrence_until: payload.recurrence_until,
+          recurrence_until: payload.recurrence_until,
+          student_id: payload.student_id,
       }, userId) : item));
       setNotice(scope === "all" ? "The recurring series was updated." : "Event updated.");
     } else {
@@ -329,7 +349,8 @@ export default function CalendarPage() {
           travel_minutes: payload.travel_minutes,
           hourly_rate: payload.hourly_rate,
           status: payload.status === "completed" ? "completed" : "scheduled",
-        }).select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status").single();
+          student_id: payload.student_id,
+        }).select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id").single();
         if (fallback.error) {
           setError(fallback.error.message || saveError.message);
           return;
@@ -338,7 +359,7 @@ export default function CalendarPage() {
       }
       if (fallbackRow) setEvents((current) => [...current, eventFromRow(fallbackRow, userId)]);
       else {
-        const { data } = await supabase.from("schedule_events").select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until").lt("starts_at", new Date(rangeEndMs).toISOString()).order("starts_at", { ascending: true });
+        const { data } = await supabase.from("schedule_events").select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id").lt("starts_at", new Date(rangeEndMs).toISOString()).order("starts_at", { ascending: true });
         if (data) setEvents(data.map((row) => eventFromRow(row, userId)));
       }
       setNotice(form.recurring ? "Weekly event added to your calendar." : "Event added to your calendar.");
@@ -465,7 +486,7 @@ export default function CalendarPage() {
         </section>
         <p className="calendar-footnote"><Clock3 size={14} /> {timezone} · Double-click a day to add an event.</p>
       </div>
-      {editorOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setEditorOpen(false); }}><section className="lesson-modal calendar-editor" role="dialog" aria-modal="true" aria-labelledby="event-modal-title"><div className="modal-heading"><div><p className="section-kicker">Calendar event</p><h2 id="event-modal-title">{editingOccurrence ? "Edit event" : "Add to your time"}</h2></div><button className="modal-close" aria-label="Close event form" onClick={() => setEditorOpen(false)}><X size={18} /></button></div><form onSubmit={saveEvent}><div className="form-grid"><label className="form-field form-field-wide"><span>Name</span><input autoFocus value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="e.g. Biology · Alex" /></label><label className="form-field form-field-wide"><span>Notes</span><input value={form.detail} onChange={(event) => setForm({ ...form, detail: event.target.value })} placeholder="What is this block for?" /></label><label className="form-field"><span>Date</span><input type="date" value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} /></label><label className="form-field"><span>Type</span><select value={form.kind} onChange={(event) => { const kind = event.target.value as EventKind; setForm({ ...form, kind, tone: kind === "lesson" ? "coral" : "teal" }); }}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label><label className="form-field"><span>Starts</span><input type="time" value={form.starts} onChange={(event) => setForm({ ...form, starts: event.target.value })} /></label><label className="form-field"><span>Ends</span><input type="time" value={form.ends} onChange={(event) => setForm({ ...form, ends: event.target.value })} /></label><label className="form-field"><span>Hourly rate</span><input type="number" min="0" step="0.5" value={form.hourlyRate} onChange={(event) => setForm({ ...form, hourlyRate: Number(event.target.value) })} /></label><label className="form-field"><span>Travel minutes</span><input type="number" min="0" value={form.travelMinutes} onChange={(event) => setForm({ ...form, travelMinutes: Number(event.target.value) })} /></label><div className="tone-picker form-field-wide"><span className="form-field-label">Color</span><div>{eventTones.map((tone) => <button type="button" key={tone} aria-label={`Use ${tone} color`} className={`tone-swatch tone-${tone} ${form.tone === tone ? "tone-selected" : ""}`} onClick={() => setForm({ ...form, tone })}></button>)}</div></div><label className="form-field"><span>Repeat</span><select value={form.recurring ? "weekly" : "once"} onChange={(event) => setForm({ ...form, recurring: event.target.value === "weekly" })}><option value="once">One time</option><option value="weekly">Weekly</option></select></label>{form.recurring && <label className="form-field"><span>Repeat until</span><input type="date" min={form.date} value={form.recurrenceUntil} onChange={(event) => setForm({ ...form, recurrenceUntil: event.target.value })} /> </label>}{form.recurring && <div className="weekday-picker form-field-wide"><span className="form-field-label">Days</span><div>{weekdayLabels.map((label, index) => <button type="button" className={form.weekdays.includes(index) ? "weekday-active" : ""} key={label} onClick={() => setForm({ ...form, weekdays: form.weekdays.includes(index) ? form.weekdays.filter((day) => day !== index) : [...form.weekdays, index] })}>{label}</button>)}</div></div>}</div>{error && <p className="form-error">{error}</p>}<div className="modal-footer"><span /><button type="button" className="secondary-button" onClick={() => setEditorOpen(false)}>Cancel</button><button type="submit" className="primary-button"><Plus size={15} /> {editingOccurrence ? "Save changes" : "Save event"}</button></div></form></section></div>}
+      {editorOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setEditorOpen(false); }}><section className="lesson-modal calendar-editor" role="dialog" aria-modal="true" aria-labelledby="event-modal-title"><div className="modal-heading"><div><p className="section-kicker">Calendar event</p><h2 id="event-modal-title">{editingOccurrence ? "Edit event" : "Add to your time"}</h2></div><button className="modal-close" aria-label="Close event form" onClick={() => setEditorOpen(false)}><X size={18} /></button></div><form onSubmit={saveEvent}><div className="form-grid"><label className="form-field form-field-wide"><span>Name</span><input autoFocus value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="e.g. Biology · Alex" /></label><label className="form-field form-field-wide"><span>Notes</span><input value={form.detail} onChange={(event) => setForm({ ...form, detail: event.target.value })} placeholder="What is this block for?" /></label><label className="form-field"><span>Date</span><input type="date" value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} /></label><label className="form-field"><span>Type</span><select value={form.kind} onChange={(event) => { const kind = event.target.value as EventKind; setForm({ ...form, kind, tone: kind === "lesson" ? defaultLessonTone : defaultPersonalTone, studentId: kind === "lesson" ? form.studentId : "" }); }}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label><label className="form-field"><span>Student</span><select value={form.studentId} disabled={form.kind === "personal"} onChange={(event) => setForm({ ...form, studentId: event.target.value })}><option value="">No student linked</option>{students.map((student) => <option value={student.id} key={student.id}>{student.name}</option>)}</select></label><label className="form-field"><span>Starts</span><input type="time" value={form.starts} onChange={(event) => setForm({ ...form, starts: event.target.value })} /></label><label className="form-field"><span>Ends</span><input type="time" value={form.ends} onChange={(event) => setForm({ ...form, ends: event.target.value })} /></label><label className="form-field"><span>Hourly rate</span><input type="number" min="0" step="0.5" value={form.hourlyRate} onChange={(event) => setForm({ ...form, hourlyRate: Number(event.target.value) })} /></label><label className="form-field"><span>Travel minutes</span><input type="number" min="0" value={form.travelMinutes} onChange={(event) => setForm({ ...form, travelMinutes: Number(event.target.value) })} /></label><div className="tone-picker form-field-wide"><span className="form-field-label">Color</span><div>{eventTones.map((tone) => <button type="button" key={tone} aria-label={`Use ${tone} color`} className={`tone-swatch tone-${tone} ${form.tone === tone ? "tone-selected" : ""}`} onClick={() => setForm({ ...form, tone })}></button>)}</div></div><label className="form-field"><span>Repeat</span><select value={form.recurring ? "weekly" : "once"} onChange={(event) => setForm({ ...form, recurring: event.target.value === "weekly" })}><option value="once">One time</option><option value="weekly">Weekly</option></select></label>{form.recurring && <label className="form-field"><span>Repeat until</span><input type="date" min={form.date} value={form.recurrenceUntil} onChange={(event) => setForm({ ...form, recurrenceUntil: event.target.value })} /> </label>}{form.recurring && <div className="weekday-picker form-field-wide"><span className="form-field-label">Days</span><div>{weekdayLabels.map((label, index) => <button type="button" className={form.weekdays.includes(index) ? "weekday-active" : ""} key={label} onClick={() => setForm({ ...form, weekdays: form.weekdays.includes(index) ? form.weekdays.filter((day) => day !== index) : [...form.weekdays, index] })}>{label}</button>)}</div></div>}</div>{error && <p className="form-error">{error}</p>}<div className="modal-footer"><span /><button type="button" className="secondary-button" onClick={() => setEditorOpen(false)}>Cancel</button><button type="submit" className="primary-button"><Plus size={15} /> {editingOccurrence ? "Save changes" : "Save event"}</button></div></form></section></div>}
       {editScopeOpen && editingOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setEditScopeOpen(false); }}><section className="lesson-modal delete-scope-modal" role="dialog" aria-modal="true" aria-labelledby="edit-scope-title"><div className="modal-heading"><div><p className="section-kicker">Choose edit scope</p><h2 id="edit-scope-title">{editingOccurrence.title}</h2><p className="calendar-subtitle">Apply these changes to the selected occurrence or the full weekly series.</p></div><button className="modal-close" aria-label="Close edit scope" onClick={() => setEditScopeOpen(false)}><X size={18} /></button></div><div className="delete-scope-options"><button className="secondary-button" onClick={() => void saveEditedScope("occurrence")}>This occurrence</button><button className="primary-button" onClick={() => void saveEditedScope("all")}>Entire series</button></div></section></div>}
       {detailsOpen && selectedOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setDetailsOpen(false); }}><section className="lesson-modal event-details-modal" role="dialog" aria-modal="true" aria-labelledby="event-details-title"><div className="modal-heading"><div><p className="section-kicker">Event details</p><h2 id="event-details-title">{selectedOccurrence.title}</h2><p className="calendar-subtitle">{new Date(selectedOccurrence.startsAt).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p></div><button className="modal-close" aria-label="Close event details" onClick={() => setDetailsOpen(false)}><X size={18} /></button></div><div className="event-detail-grid"><div><span>Time</span><strong>{formatTime(selectedOccurrence.startsAt)}–{formatTime(selectedOccurrence.endsAt)}</strong></div><div><span>Type</span><strong>{selectedOccurrence.kind === "lesson" ? "Lesson" : "Personal"}</strong></div><div><span>Rate</span><strong>{selectedOccurrence.kind === "lesson" ? `$${selectedOccurrence.fixedFee ?? selectedOccurrence.hourlyRate}/h` : "Not applicable"}</strong></div><div><span>Travel</span><strong>{selectedOccurrence.travelMinutes} minutes</strong></div><div><span>Status</span><strong>{selectedOccurrence.status}</strong></div><div><span>Repeat</span><strong>{selectedOccurrence.isRecurring ? "Weekly series" : "One time"}</strong></div>{selectedOccurrence.detail && <div className="event-detail-wide"><span>Notes</span><strong>{selectedOccurrence.detail}</strong></div>}</div><div className="modal-footer"><button type="button" className="delete-button" onClick={requestDelete}>Delete event</button><span /><button type="button" className="secondary-button" onClick={() => openOccurrenceEditor(selectedOccurrence)}>Edit</button><button type="button" className="secondary-button" onClick={() => setDetailsOpen(false)}>Close</button></div></section></div>}
       {deleteConfirmOpen && selectedOccurrence && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !deleting) setDeleteConfirmOpen(false); }}><section className="lesson-modal delete-scope-modal" role="dialog" aria-modal="true" aria-labelledby="delete-warning-title"><div className="modal-heading"><div><p className="section-kicker">Remove event</p><h2 id="delete-warning-title">Delete {selectedOccurrence.title}?</h2></div><button className="modal-close" aria-label="Close delete warning" disabled={deleting} onClick={() => setDeleteConfirmOpen(false)}><X size={18} /></button></div><div className="delete-warning"><strong>This cannot be undone.</strong><p>{selectedOccurrence.isRecurring ? "The next step will let you choose whether to remove this occurrence, this and following occurrences, or the entire series." : "This event will be permanently removed from your calendar."}</p></div><div className="modal-footer"><button type="button" className="secondary-button" disabled={deleting} onClick={() => setDeleteConfirmOpen(false)}>Keep event</button><span />{selectedOccurrence.isRecurring ? <button type="button" className="delete-button" disabled={deleting} onClick={continueDelete}>Choose deletion scope</button> : <button type="button" className="delete-button" disabled={deleting} onClick={() => void deleteSelectedOccurrence("all")}>Delete event</button>}</div></section></div>}

@@ -108,6 +108,27 @@ h1, h2, p { margin: 0; }.welcome-row h1 { font-size: clamp(31px, 3.1vw, 46px); l
 .event-detail-grid strong { color: var(--ink); font: 13px/1.35 Arial, sans-serif; }
 .event-detail-wide { grid-column: 1 / -1; }
 .delete-warning { margin: 20px 24px 0; padding: 13px 14px; border-left: 3px solid #c87868; background: #fff4f0; color: #7d625d; }
+
+.workspace-page { max-width: 1120px; }
+.back-link:hover { color: #c96752; }
+.workspace-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 22px; padding: 12px 14px; }
+.workspace-search { display: flex; align-items: center; gap: 9px; flex: 1; color: #9aa6a2; }
+.workspace-search input { width: 100%; border: 0; outline: 0; background: transparent; color: var(--ink); font: 13px Arial, sans-serif; }
+.workspace-search input::placeholder { color: #aab4b0; }
+.student-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.student-card { padding: 19px; }
+.student-card-heading { display: flex; align-items: center; gap: 11px; }
+.student-avatar { width: 39px; height: 39px; display: grid; place-items: center; flex: 0 0 39px; border-radius: 50%; background: #e6f0ea; color: #668976; font: 600 11px Arial, sans-serif; }
+.student-card h2 { font-size: 17px; font-weight: 400; }
+.status-pill { display: inline-block; margin-top: 5px; padding: 4px 6px; border-radius: 4px; font: 9px Arial, sans-serif; text-transform: capitalize; }
+.status-active { background: #eef6ee; color: #65866e; }.status-archived { background: #f1f2ef; color: #8b9591; }
+.student-contact { display: grid; gap: 5px; min-height: 38px; margin: 20px 0 13px; color: #778784; font: 11px/1.35 Arial, sans-serif; overflow-wrap: anywhere; }
+.student-notes { min-height: 35px; color: #8a9692; font-size: 12px; line-height: 1.45; }
+.student-card-footer { display: flex; align-items: center; gap: 8px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #edf0eb; }.student-card-footer .text-button { margin-left: auto; }
+.empty-workspace { display: grid; justify-items: center; gap: 10px; padding: 70px 24px; text-align: center; }.empty-workspace-icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 50%; background: #f8e9e4; color: var(--coral); }.empty-workspace h2 { font-size: 20px; font-weight: 400; }.empty-workspace p { max-width: 390px; color: #899693; font-size: 13px; line-height: 1.5; }.empty-workspace .primary-button { margin-top: 9px; }
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }.settings-card-wide { grid-column: 1 / -1; }.settings-card-body { display: grid; gap: 16px; padding: 21px; }.settings-two-column { grid-template-columns: repeat(2, minmax(0, 1fr)); }.settings-actions { display: flex; justify-content: space-between; grid-column: 1 / -1; }.data-success { display: flex; align-items: center; gap: 7px; }
+@media (max-width: 900px) { .student-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 680px) { .calendar-topbar .back-link { font-size: 0; }.calendar-topbar .back-link svg { width: 18px; height: 18px; }.workspace-page { padding-top: 31px; }.workspace-toolbar { align-items: stretch; flex-direction: column; }.student-grid, .settings-grid, .settings-two-column { grid-template-columns: 1fr; }.settings-card-wide, .settings-actions { grid-column: auto; }.settings-actions .primary-button { width: 100%; justify-content: center; }.student-card-footer { flex-wrap: wrap; }.student-card-footer .text-button { margin-left: auto; } }
 .delete-warning strong { display: block; color: #a65348; font: 600 12px Arial, sans-serif; }
 .delete-warning p { margin: 5px 0 0; font: 11px/1.45 Arial, sans-serif; }
 .availability-panel { grid-column: 1 / -1; }

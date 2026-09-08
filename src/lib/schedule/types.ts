@@ -5,6 +5,28 @@ export type CalendarView = "day" | "week" | "month";
 export type DeleteScope = "occurrence" | "following" | "all";
 export type EditScope = "occurrence" | "all";
 export type StaminaState = "low" | "mid" | "high" | "overload";
+export type StudentStatus = "active" | "archived";
+
+export type Student = {
+  id: string;
+  userId: string;
+  name: string;
+  email: string;
+  phone: string;
+  notes: string;
+  status: StudentStatus;
+};
+
+export type SchedulePreferences = {
+  displayName: string;
+  timezone: string;
+  dailyStaminaLimit: number;
+  weeklyStaminaLimit: number;
+  defaultLessonRate: number;
+  defaultTravelMinutes: number;
+  defaultLessonTone: EventTone;
+  defaultPersonalTone: EventTone;
+};
 
 export type ScheduleEvent = {
   id: string;
@@ -24,6 +46,7 @@ export type ScheduleEvent = {
   status: EventStatus;
   recurrenceWeekdays: number[];
   recurrenceUntil: string | null;
+  studentId: string | null;
 };
 
 export type ScheduleOccurrence = ScheduleEvent & {
