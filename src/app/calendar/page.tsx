@@ -103,6 +103,12 @@ function eventFromRow(row: Record<string, unknown>, userId: string): ScheduleEve
   };
 }
 
+function normalizedTimestamp(value: unknown) {
+  if (!value) return null;
+  const date = new Date(String(value));
+  return Number.isNaN(date.getTime()) ? String(value) : date.toISOString();
+}
+
 function formatTime(value: string) {
   return new Date(value).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
@@ -656,9 +662,9 @@ function exceptionFromRow(row: Record<string, unknown>): ScheduleEventException 
   return {
     id: String(row.id),
     eventId: String(row.event_id),
-    originalStartsAt: String(row.original_starts_at),
-    startsAt: row.starts_at ? String(row.starts_at) : null,
-    endsAt: row.ends_at ? String(row.ends_at) : null,
+    originalStartsAt: normalizedTimestamp(row.original_starts_at) ?? String(row.original_starts_at),
+    startsAt: normalizedTimestamp(row.starts_at),
+    endsAt: normalizedTimestamp(row.ends_at),
     status: (row.status as EventStatus) ?? "cancelled",
     title: row.title ? String(row.title) : null,
     detail: row.detail ? String(row.detail) : null,

@@ -1,6 +1,11 @@
 import { addDays, dateKey } from "./dates";
 import type { CalendarRange, ScheduleEvent, ScheduleEventException, ScheduleOccurrence } from "./types";
 
+function recurrenceTimestamp(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toISOString();
+}
+
 export function expandEvent(event: ScheduleEvent, exceptions: ScheduleEventException[], range: CalendarRange): ScheduleOccurrence[] {
   if (event.status === "cancelled" || event.status === "skipped") return [];
   const baseStart = new Date(event.startsAt);
@@ -12,14 +17,14 @@ export function expandEvent(event: ScheduleEvent, exceptions: ScheduleEventExcep
   const rangeDate = new Date(range.start.getFullYear(), range.start.getMonth(), range.start.getDate(), 12);
   const firstDate = recurring && baseDate < rangeDate ? rangeDate : recurring ? baseDate : baseStart;
   const lastDate = recurring ? new Date(range.end.getFullYear(), range.end.getMonth(), range.end.getDate(), 12) : addDays(firstDate, 1);
-  const exceptionMap = new Map(exceptions.filter((exception) => exception.eventId === event.id).map((exception) => [exception.originalStartsAt, exception]));
+  const exceptionMap = new Map(exceptions.filter((exception) => exception.eventId === event.id).map((exception) => [recurrenceTimestamp(exception.originalStartsAt), exception]));
 
   for (let cursor = firstDate; cursor < lastDate; cursor = addDays(cursor, 1)) {
     if (recurring && !event.recurrenceWeekdays.includes(cursor.getDay())) continue;
     const generatedStart = recurring
       ? new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), baseStart.getHours(), baseStart.getMinutes())
       : baseStart;
-    const exception = exceptionMap.get(generatedStart.toISOString());
+    const exception = exceptionMap.get(recurrenceTimestamp(generatedStart.toISOString()));
     if (exception?.status === "cancelled" || exception?.status === "skipped") continue;
     const occurrenceStart = exception?.startsAt ? new Date(exception.startsAt) : generatedStart;
     const occurrenceEnd = exception?.endsAt ? new Date(exception.endsAt) : new Date(occurrenceStart.getTime() + duration);
