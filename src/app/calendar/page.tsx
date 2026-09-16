@@ -41,6 +41,7 @@ const getInitialTimezone = () => "Local time";
 const getBrowserStudentQuery = () => new URLSearchParams(window.location.search).get("student") ?? "";
 const getInitialStudentQuery = () => "";
 const storageKey = "daylight-lessons";
+const scheduleChangedEvent = "daylight-schedule-changed";
 const supabaseConfigured = Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY);
 const CALENDAR_START_MINUTES = 7 * 60;
 const CALENDAR_END_MINUTES = 22 * 60;
@@ -53,6 +54,11 @@ const calendarTimeLabels = Array.from(
     return `${String(Math.floor(totalMinutes / 60)).padStart(2, "0")}:${String(totalMinutes % 60).padStart(2, "0")}`;
   },
 );
+
+function notifyScheduleChanged() {
+  window.localStorage.setItem("daylight-schedule-version", String(Date.now()));
+  window.dispatchEvent(new Event(scheduleChangedEvent));
+}
 
 function emptyForm(date = initialDateKey): EventForm {
   const weekday = dateFromKey(date).getDay();
@@ -363,6 +369,7 @@ export default function CalendarPage() {
       setEditScopeOpen(false);
       setEditingOccurrence(null);
       setAnchorDate(dateFromKey(form.date));
+      notifyScheduleChanged();
       return;
     }
 
@@ -475,6 +482,7 @@ export default function CalendarPage() {
     setEditScopeOpen(false);
     setEditingOccurrence(null);
     setAnchorDate(dateFromKey(form.date));
+    notifyScheduleChanged();
   };
 
   const saveEvent = async (event: FormEvent<HTMLFormElement>) => {
@@ -558,23 +566,46 @@ export default function CalendarPage() {
       setDetailsOpen(false);
       setSelectedOccurrence(null);
       setNotice("Event deleted.");
+      notifyScheduleChanged();
       return;
     }
     const supabase = createClient();
-    let deleteError = null;
-    if (!selectedOccurrence.isRecurring || scope === "all") {
-      const result = await supabase.from("schedule_events").delete().eq("id", selectedOccurrence.id);
+    const baseEvent = events.find((event) => event.id === selectedOccurrence.id);
+    const isFirstOccurrence = Boolean(baseEvent && new Date(baseEvent.startsAt).getTime() === new Date(selectedOccurrence.originalStartsAt).getTime());
+    let deleteError: Error | null = null;
+    let deletedParent = false;
+    let deletedLegacy = false;
+
+    if (selectedOccurrence.isRecurring && scope === "occurrence") {
+      const result = await supabase.from("schedule_event_exceptions").upsert({
+        event_id: selectedOccurrence.id,
+        original_starts_at: selectedOccurrence.originalStartsAt,
+        status: "cancelled",
+      }, { onConflict: "event_id,original_starts_at" }).select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").single();
       deleteError = result.error;
-    } else if (scope === "following" && dateKey(new Date(selectedOccurrence.originalStartsAt)) > dateKey(new Date(selectedOccurrence.startsAt))) {
-      const cutoff = new Date(selectedOccurrence.originalStartsAt);
-      cutoff.setDate(cutoff.getDate() - 1);
-      const result = await supabase.from("schedule_events").update({ recurrence_until: dateKey(cutoff) }).eq("id", selectedOccurrence.id);
+      if (!deleteError && result.data) {
+        setExceptions((current) => [...current.filter((item) => !(item.eventId === selectedOccurrence.id && item.originalStartsAt === selectedOccurrence.originalStartsAt)), exceptionFromRow(result.data)]);
+      }
+    } else if (selectedOccurrence.isRecurring && scope === "following" && !isFirstOccurrence) {
+      const cutoff = dateKey(addDays(dateFromKey(dateKey(new Date(selectedOccurrence.originalStartsAt))), -1));
+      const result = await supabase.from("schedule_events").update({ recurrence_until: cutoff }).eq("id", selectedOccurrence.id).select("id, recurrence_until").single();
       deleteError = result.error;
+      if (!deleteError) {
+        setEvents((current) => current.map((event) => event.id === selectedOccurrence.id ? { ...event, recurrenceUntil: cutoff } : event));
+        setExceptions((current) => current.filter((exception) => exception.eventId !== selectedOccurrence.id || dateKey(new Date(exception.originalStartsAt)) < dateKey(new Date(selectedOccurrence.originalStartsAt))));
+      }
     } else {
-      const result = scope === "following"
-        ? await supabase.from("schedule_events").delete().eq("id", selectedOccurrence.id)
-        : await supabase.from("schedule_event_exceptions").upsert({ event_id: selectedOccurrence.id, original_starts_at: selectedOccurrence.originalStartsAt, status: "cancelled" }, { onConflict: "event_id,original_starts_at" });
-      deleteError = result.error;
+      const canonicalResult = await supabase.from("schedule_events").delete().eq("id", selectedOccurrence.id).select("id");
+      deletedParent = !canonicalResult.error && (canonicalResult.data?.length ?? 0) > 0;
+      const legacyResult = await supabase.from("lessons").delete().eq("id", selectedOccurrence.id).select("id");
+      deletedLegacy = !legacyResult.error && (legacyResult.data?.length ?? 0) > 0;
+      if (!deletedParent && !deletedLegacy) {
+        deleteError = canonicalResult.error ?? legacyResult.error ?? new Error("The event could not be found for deletion.");
+      }
+      if (!deleteError) {
+        setEvents((current) => current.filter((event) => event.id !== selectedOccurrence.id));
+        setExceptions((current) => current.filter((exception) => exception.eventId !== selectedOccurrence.id));
+      }
     }
     setDeleting(false);
     if (deleteError) {
@@ -586,7 +617,7 @@ export default function CalendarPage() {
     setDetailsOpen(false);
     setSelectedOccurrence(null);
     setNotice(scope === "occurrence" ? "This occurrence was removed." : scope === "following" ? "This and future occurrences were removed." : "The recurring event was deleted.");
-    setAnchorDate((current) => new Date(current));
+    notifyScheduleChanged();
   };
 
   return (

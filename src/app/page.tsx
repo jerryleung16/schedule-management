@@ -49,6 +49,7 @@ type Lesson = {
 };
 
 const storageKey = "daylight-lessons";
+const scheduleChangedEvent = "daylight-schedule-changed";
 const availabilityStorageKey = "daylight-weekly-availability";
 const scheduleDate = new Date().toISOString().slice(0, 10);
 const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -57,6 +58,11 @@ const supabaseConfigured = Boolean(
   process.env.NEXT_PUBLIC_SUPABASE_URL &&
   process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
 );
+
+function notifyScheduleChanged() {
+  window.localStorage.setItem("daylight-schedule-version", String(Date.now()));
+  window.dispatchEvent(new Event(scheduleChangedEvent));
+}
 
 const navigation: { label: string; icon: IconComponent; active?: boolean }[] = [
   { label: "Overview", icon: LayoutDashboard, active: true },
@@ -310,6 +316,7 @@ export default function Home() {
   const [notice, setNotice] = useState("");
   const [activeNav, setActiveNav] = useState("Overview");
   const [selectedDate, setSelectedDate] = useState(scheduleDate);
+  const [scheduleRefreshVersion, setScheduleRefreshVersion] = useState(0);
   const [isCloudSaving, setIsCloudSaving] = useState(false);
   const [monthlyCompletedEarnings, setMonthlyCompletedEarnings] = useState(0);
   const [monthlyCompletedCount, setMonthlyCompletedCount] = useState(0);
@@ -328,6 +335,20 @@ export default function Home() {
   const [calculatorValue, setCalculatorValue] = useState("128 / 4");
   const [calculatorResult, setCalculatorResult] = useState("32");
   const [calculatorError, setCalculatorError] = useState("");
+
+  useEffect(() => {
+    const refresh = () => setScheduleRefreshVersion((current) => current + 1);
+    window.addEventListener(scheduleChangedEvent, refresh);
+    window.addEventListener("focus", refresh);
+    window.addEventListener("pageshow", refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener(scheduleChangedEvent, refresh);
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("pageshow", refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, []);
 
   useEffect(() => {
     const loadLessons = async () => {
@@ -421,9 +442,17 @@ export default function Home() {
         .from("schedule_events")
         .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id")
         .lt("starts_at", monthEnd.toISOString());
-      if (!canonicalMonth.error) {
-        const monthEvents = (canonicalMonth.data ?? []).map((row) => scheduleEventFromRow(row, userData.user.id));
-        const monthIds = (canonicalMonth.data ?? []).map((row) => row.id);
+      const legacyMonth = await supabase
+        .from("lessons")
+        .select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id")
+        .gte("starts_at", monthStart.toISOString())
+        .lt("starts_at", monthEnd.toISOString());
+      if (!canonicalMonth.error || !legacyMonth.error) {
+        const canonicalRows = canonicalMonth.data ?? [];
+        const canonicalIds = new Set(canonicalRows.map((row) => String(row.id)));
+        const monthRows = [...canonicalRows, ...(legacyMonth.data ?? []).filter((row) => !canonicalIds.has(String(row.id)))];
+        const monthEvents = monthRows.map((row) => scheduleEventFromRow(row, userData.user.id));
+        const monthIds = canonicalRows.map((row) => row.id);
         const monthExceptions = monthIds.length
           ? await supabase.from("schedule_event_exceptions").select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").in("event_id", monthIds)
           : { data: [], error: null };
@@ -432,10 +461,8 @@ export default function Home() {
         setMonthlyCompletedCount(payableLessons.length);
         setMonthlyCompletedEarnings(payableLessons.reduce((total, occurrence) => total + ((new Date(occurrence.endsAt).getTime() - new Date(occurrence.startsAt).getTime()) / 3600000) * occurrence.hourlyRate, 0));
       } else {
-        const fallbackMonth = await supabase.from("lessons").select("starts_at, ends_at, kind, hourly_rate, status").gte("starts_at", monthStart.toISOString()).lt("starts_at", monthEnd.toISOString());
-        const payableLessons = (fallbackMonth.data ?? []).filter((row) => row.kind === "lesson" && row.status !== "cancelled" && row.status !== "skipped");
-        setMonthlyCompletedCount(payableLessons.length);
-        setMonthlyCompletedEarnings(payableLessons.reduce((total, row) => total + ((new Date(row.ends_at).getTime() - new Date(row.starts_at).getTime()) / 3600000) * Number(row.hourly_rate), 0));
+        setMonthlyCompletedCount(0);
+        setMonthlyCompletedEarnings(0);
       }
       const weekRange = rangeForView(selectedMonth, "week");
       const weekStart = weekRange.start;
@@ -491,7 +518,7 @@ export default function Home() {
 
     const loadTimer = window.setTimeout(() => { void loadLessons(); }, 0);
     return () => window.clearTimeout(loadTimer);
-  }, [selectedDate]);
+  }, [scheduleRefreshVersion, selectedDate]);
 
   useEffect(() => {
     if (supabaseConfigured && !userId) return;
@@ -779,6 +806,7 @@ export default function Home() {
     setLessonDetailsOpen(false);
     setLessonDeleteConfirmOpen(false);
     setEditingLesson(null);
+    notifyScheduleChanged();
   };
 
   const signOut = async () => {
