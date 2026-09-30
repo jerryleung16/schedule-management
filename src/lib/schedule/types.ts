@@ -84,6 +84,14 @@ export type WeeklyAvailability = {
   ends: string;
 };
 
+export type WeeklyWorkingPlace = {
+  id?: string;
+  weekday: number;
+  place: string;
+};
+
+export type WorkingPlacesByWeekday = Partial<Record<number, string>>;
+
 export type SuggestedSlot = {
   date: string;
   starts: string;

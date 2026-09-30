@@ -7,7 +7,8 @@ import { createClient } from "@/lib/supabase/client";
 import { slotConflicts } from "@/lib/schedule/availability";
 import { addDays, dateKey, dateFromKey, formatRangeLabel, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
-import type { CalendarView, DeleteScope, EditScope, EventKind, EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, Student } from "@/lib/schedule/types";
+import { normalizeWeeklyWorkingPlaces, workingPlaceForWeekday, workingPlaceStorageKey, workingPlacesToMap } from "@/lib/schedule/workplaces";
+import type { CalendarView, DeleteScope, EditScope, EventKind, EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, Student, WeeklyWorkingPlace, WorkingPlacesByWeekday } from "@/lib/schedule/types";
 
 type EventForm = {
   title: string;
@@ -148,6 +149,7 @@ export default function CalendarPage() {
   const [profileTimezone, setProfileTimezone] = useState<string | null>(null);
   const [students, setStudents] = useState<Student[]>([]);
   const [studentDirectory, setStudentDirectory] = useState<Student[]>([]);
+  const [workingPlaces, setWorkingPlaces] = useState<WorkingPlacesByWeekday>({});
   const [studentFilter, setStudentFilter] = useState("unlinked");
   const [defaultLessonRate, setDefaultLessonRate] = useState(35);
   const [defaultTravelMinutes, setDefaultTravelMinutes] = useState(0);
@@ -211,6 +213,14 @@ export default function CalendarPage() {
               }
             } catch { window.localStorage.removeItem("daylight-students"); }
           }
+          const storedWorkingPlaces = window.localStorage.getItem(workingPlaceStorageKey);
+          if (storedWorkingPlaces) {
+            try {
+              const parsed = JSON.parse(storedWorkingPlaces) as Record<string, unknown>;
+              const places = Object.entries(parsed).map(([weekday, place]) => ({ weekday: Number(weekday), place: String(place ?? "") }));
+              if (!cancelled) setWorkingPlaces(workingPlacesToMap(normalizeWeeklyWorkingPlaces(places)));
+            } catch { window.localStorage.removeItem(workingPlaceStorageKey); }
+          }
           if (!cancelled) {
             setUserId("local");
             setEvents(localEvents);
@@ -242,6 +252,22 @@ export default function CalendarPage() {
         const directory = (studentData ?? []).map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" as const : "active" as const }));
         setStudentDirectory(directory);
         setStudents(directory.filter((student) => student.status === "active"));
+      }
+      const { data: workingPlaceData, error: workingPlaceError } = await supabase.from("weekly_working_places").select("id, weekday, place").eq("user_id", authData.user.id).order("weekday");
+      if (!cancelled) {
+        if (workingPlaceError) {
+          const storedWorkingPlaces = window.localStorage.getItem(workingPlaceStorageKey);
+          if (storedWorkingPlaces) {
+            try {
+              const parsed = JSON.parse(storedWorkingPlaces) as Record<string, unknown>;
+              const places = Object.entries(parsed).map(([weekday, place]) => ({ weekday: Number(weekday), place: String(place ?? "") }));
+              setWorkingPlaces(workingPlacesToMap(normalizeWeeklyWorkingPlaces(places)));
+            } catch { window.localStorage.removeItem(workingPlaceStorageKey); }
+          }
+        } else {
+          const places = (workingPlaceData ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), place: String(row.place ?? "") } satisfies WeeklyWorkingPlace));
+          setWorkingPlaces(workingPlacesToMap(normalizeWeeklyWorkingPlaces(places)));
+        }
       }
 
       const { data, error: eventError } = await supabase
@@ -645,7 +671,7 @@ export default function CalendarPage() {
             <div className="calendar-toolbar-left"><button className="round-button" aria-label="Previous range" onClick={() => shiftRange(-1)}><ChevronLeft size={17} /></button><button className="round-button" aria-label="Next range" onClick={() => shiftRange(1)}><ChevronRight size={17} /></button><button className="today-button" onClick={() => setAnchorDate(dateFromKey(todayKey))}>Today</button><strong>{formatRangeLabel(activeAnchorDate, view)}</strong></div>
               <div className="view-toggle"><button className={view === "day" ? "view-active" : ""} onClick={() => setView("day")}>Day</button><button className={view === "week" ? "view-active" : ""} onClick={() => setView("week")}>Week</button><button className={view === "month" ? "view-active" : ""} onClick={() => setView("month")}>Month</button></div><label className="calendar-student-filter"><span>Student</span><select value={effectiveStudentFilter} onChange={(event) => { const value = event.target.value; setStudentFilter(value); if (requestedStudent) router.replace("/calendar"); }}><option value="all">All students</option><option value="unlinked">Unlinked</option>{studentDirectory.map((student) => <option value={student.id} key={student.id}>{student.name}{student.status === "archived" ? " (archived)" : ""}</option>)}</select></label>
           </div>
-          {loading ? <div className="calendar-empty">Loading your calendar...</div> : view === "day" || view === "week" ? <div className={`week-calendar ${view === "day" ? "day-calendar" : ""}`}><div className="week-gutter" /><div className="week-day-heads">{days.map((day) => <div className="calendar-day-head" key={dateKey(day)}><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>)}</div><div className="week-times">{calendarTimeLabels.map((label) => <span key={label}>{label}</span>)}</div><div className="week-grid">{days.map((day) => { const dayEvents = occurrencesForDay(day); return <div className="week-day-column" key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="calendar-hour-lines" />{dayEvents.map((item, index) => <button className={`calendar-event event-${item.tone}`} key={item.occurrenceKey} style={eventStyle(item, index, Math.max(1, dayEvents.length))} onClick={() => openOccurrenceDetails(item)}><strong>{item.title}</strong><span>{formatTime(item.startsAt)} · {item.kind === "lesson" ? `${studentName(item.studentId)} · $${item.fixedFee ?? item.hourlyRate}/h` : "Personal"}</span></button>)}</div>; })}</div></div> : <div className="month-calendar">{days.map((day) => { const dayEvents = occurrencesForDay(day); const outside = day.getMonth() !== activeAnchorDate.getMonth(); return <div className={`month-day ${outside ? "month-day-outside" : ""}`} key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="month-day-number"><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>{dayEvents.slice(0, 4).map((item) => <button className={`month-event event-${item.tone}`} key={item.occurrenceKey} onClick={() => openOccurrenceDetails(item)}>{formatTime(item.startsAt)} {item.title}{item.kind === "lesson" ? ` · ${studentName(item.studentId)}` : ""}</button>)}{dayEvents.length > 4 && <span className="more-events">+{dayEvents.length - 4} more</span>}</div>; })}</div>}
+          {loading ? <div className="calendar-empty">Loading your calendar...</div> : view === "day" || view === "week" ? <div className={`week-calendar ${view === "day" ? "day-calendar" : ""}`}><div className="week-gutter" /><div className="week-day-heads">{days.map((day) => <div className="calendar-day-head" key={dateKey(day)}><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong>{workingPlaceForWeekday(workingPlaces, day.getDay()) && <small className="calendar-day-place">{workingPlaceForWeekday(workingPlaces, day.getDay())}</small>}</div>)}</div><div className="week-times">{calendarTimeLabels.map((label) => <span key={label}>{label}</span>)}</div><div className="week-grid">{days.map((day) => { const dayEvents = occurrencesForDay(day); return <div className="week-day-column" key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="calendar-hour-lines" />{dayEvents.map((item, index) => <button className={`calendar-event event-${item.tone}`} key={item.occurrenceKey} style={eventStyle(item, index, Math.max(1, dayEvents.length))} onClick={() => openOccurrenceDetails(item)}><strong>{item.title}</strong><span>{formatTime(item.startsAt)} · {item.kind === "lesson" ? `${studentName(item.studentId)} · $${item.fixedFee ?? item.hourlyRate}/h` : "Personal"}</span></button>)}</div>; })}</div></div> : <div className="month-calendar">{days.map((day) => { const dayEvents = occurrencesForDay(day); const outside = day.getMonth() !== activeAnchorDate.getMonth(); return <div className={`month-day ${outside ? "month-day-outside" : ""}`} key={dateKey(day)} onDoubleClick={() => openEditor(dateKey(day))}><div className="month-day-number"><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong className={dateKey(day) === todayKey ? "day-today" : ""}>{day.getDate()}</strong></div>{workingPlaceForWeekday(workingPlaces, day.getDay()) && <small className="month-day-place">{workingPlaceForWeekday(workingPlaces, day.getDay())}</small>}{dayEvents.slice(0, 4).map((item) => <button className={`month-event event-${item.tone}`} key={item.occurrenceKey} onClick={() => openOccurrenceDetails(item)}>{formatTime(item.startsAt)} {item.title}{item.kind === "lesson" ? ` · ${studentName(item.studentId)}` : ""}</button>)}{dayEvents.length > 4 && <span className="more-events">+{dayEvents.length - 4} more</span>}</div>; })}</div>}
         </section>
         <p className="calendar-footnote"><Clock3 size={14} /> {timezone} · Double-click a day to add an event.</p>
       </div>

@@ -1,5 +1,5 @@
 import { addDays, dateKey } from "./dates";
-import type { CalendarRange, ScheduleOccurrence, StaminaState, SuggestedSlot, WeeklyAvailability } from "./types";
+import type { CalendarRange, ScheduleOccurrence, StaminaState, SuggestedSlot, WeeklyAvailability, WorkingPlacesByWeekday } from "./types";
 
 type BusyOccurrence = Pick<ScheduleOccurrence, "startsAt" | "endsAt">;
 
@@ -189,14 +189,17 @@ export function normalizeWeeklyAvailability(intervals: WeeklyAvailability[]) {
     .sort((left, right) => left.weekday - right.weekday || left.starts.localeCompare(right.starts));
 }
 
-export function formatWeeklyAvailabilityMessage(intervals: WeeklyAvailability[]) {
+export function formatWeeklyAvailabilityMessage(intervals: WeeklyAvailability[], workingPlaces: WorkingPlacesByWeekday = {}) {
   const normalized = normalizeWeeklyAvailability(intervals);
   const lines = ["Dear Client,", "", "Please find my recurring weekly availability below:", ""];
   if (!normalized.length) lines.push("I do not have any availability windows set yet.");
   for (let weekday = 0; weekday < 7; weekday += 1) {
     const dayIntervals = normalized.filter((interval) => interval.weekday === weekday);
-    if (dayIntervals.length) {
-      lines.push(`${weekdayNames[weekday]}: ${dayIntervals.map((interval) => `${formatAvailabilityTime(interval.starts)}–${formatAvailabilityTime(interval.ends)}`).join(", ")}`);
+    const place = workingPlaces[weekday]?.trim();
+    if (dayIntervals.length || place) {
+      const windows = dayIntervals.map((interval) => `${formatAvailabilityTime(interval.starts)}–${formatAvailabilityTime(interval.ends)}`).join(", ");
+      const details = [windows, place ? `Workplace: ${place}` : ""].filter(Boolean).join(" · ");
+      lines.push(`${weekdayNames[weekday]}: ${details}`);
     }
   }
   lines.push("", "Please let me know which of these times would be most convenient for you.", "", "Kind regards,");

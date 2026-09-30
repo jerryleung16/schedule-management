@@ -142,6 +142,9 @@ h1, h2, p { margin: 0; }.welcome-row h1 { font-size: clamp(31px, 3.1vw, 46px); l
 .availability-day-heading strong { color: #536563; font: 600 12px Arial, sans-serif; }
 .availability-date { display: block; margin-top: 3px; color: #9aa6a2; font: 10px Arial, sans-serif; }
 .availability-day-heading .text-button { margin: 0; }
+.availability-place { display: grid; gap: 5px; margin: 8px 0 10px; }
+.availability-place span { color: #879492; font: 9px Arial, sans-serif; letter-spacing: .08em; text-transform: uppercase; }
+.availability-place input { min-height: 32px; padding: 6px 8px; border: 1px solid #dfe3dc; border-radius: 5px; background: #fbfbf8; color: var(--ink); font: 12px Arial, sans-serif; outline: 0; }
 .availability-occupied { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 10px; }
 .availability-occupied span { padding: 4px 6px; border-left: 2px solid #c87868; background: #fff4f0; color: #8a625b; font: 10px/1.3 Arial, sans-serif; }
 .availability-free-heading { margin-top: 4px; color: #879492; font: 9px Arial, sans-serif; letter-spacing: .08em; text-transform: uppercase; }
@@ -157,8 +160,23 @@ h1, h2, p { margin: 0; }.welcome-row h1 { font-size: clamp(31px, 3.1vw, 46px); l
 .availability-message-heading .form-field-label { margin: 0; }
 .availability-message { width: 100%; min-height: 150px; margin-top: 9px; padding: 11px; border: 1px solid #dfe3dc; border-radius: 6px; resize: vertical; background: #fbfbf8; color: var(--ink); font: 12px/1.5 Arial, sans-serif; outline: 0; }
 .availability-conflict { margin: 14px 0 0; padding: 10px 12px; border-left: 3px solid #c87868; background: #fff4f0; color: #8a5148; font: 11px/1.45 Arial, sans-serif; }
-.availability-message:focus, .availability-window input:focus { border-color: var(--coral); box-shadow: 0 0 0 3px rgba(220,118,93,.12); }
-@media (max-width: 680px) { .availability-days { grid-template-columns: 1fr; }.availability-content { padding-left: 16px; padding-right: 16px; }.availability-window input { min-width: 0; flex: 1; }.availability-message-heading { align-items: flex-start; flex-direction: column; } }
+.availability-message:focus, .availability-window input:focus, .availability-place input:focus { border-color: var(--coral); box-shadow: 0 0 0 3px rgba(220,118,93,.12); }
+.availability-month-heading { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-top: 26px; padding-top: 19px; border-top: 1px solid #edf0eb; }
+.availability-month-heading > div { display: grid; gap: 3px; }
+.availability-month-heading strong { color: #536563; font: 400 18px Georgia, serif; }
+.availability-month-heading > span { color: #9aa6a2; font: 10px Arial, sans-serif; }
+.availability-month-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 1px; margin-top: 12px; border: 1px solid #edf0eb; background: #edf0eb; }
+.availability-month-day { min-height: 86px; padding: 8px; background: #fff; }
+.availability-month-day > div { display: flex; align-items: center; justify-content: space-between; gap: 5px; }
+.availability-month-day > div span { color: #a0aaa6; font: 9px Arial, sans-serif; }
+.availability-month-day > div strong { color: #536563; font: 13px Georgia, serif; }
+.availability-month-day p { margin: 10px 0 0; color: #5f746e; font: 10px/1.35 Arial, sans-serif; }
+.availability-month-day small { display: block; overflow: hidden; margin-top: 5px; color: #bd624f; font: 600 9px Arial, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
+.availability-month-empty { color: #b0bab5 !important; }
+@media (max-width: 680px) { .availability-days { grid-template-columns: 1fr; }.availability-content { padding-left: 16px; padding-right: 16px; }.availability-window input { min-width: 0; flex: 1; }.availability-message-heading { align-items: flex-start; flex-direction: column; }.availability-month-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.calendar-day-head { flex-wrap: wrap; align-content: center; }
+.calendar-day-place { overflow: hidden; width: 100%; color: #bd624f; font: 600 9px Arial, sans-serif; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+.month-day-place { display: block; overflow: hidden; margin: 0 0 6px; color: #bd624f; font: 600 9px Arial, sans-serif; text-overflow: ellipsis; white-space: nowrap; }
 .calendar-editor { max-height: calc(100vh - 40px); overflow: auto; }.delete-scope-modal { width: min(430px, calc(100vw - 32px)); }.delete-scope-options { display: grid; gap: 9px; }.delete-scope-options button { justify-content: flex-start; }
 .schedule-track .line-1 { top: 0; }.schedule-track .line-2 { top: 14.2857%; }.schedule-track .line-3 { top: 28.5714%; }.schedule-track .line-4 { top: 42.8571%; }.schedule-track .line-5 { top: 57.1428%; }.schedule-track .line-6 { top: 71.4285%; }.schedule-track .line-7 { top: 85.7142%; }
 .weekday-picker > div { display: flex; gap: 5px; }.form-field-label { display: block; margin-bottom: 7px; font: 9px Arial, sans-serif; color: #879492; letter-spacing: .1em; text-transform: uppercase; }.weekday-picker button { min-width: 38px; min-height: 31px; border: 1px solid #dfe3dc; border-radius: 5px; background: #fbfbf8; color: #84918e; font: 10px Arial, sans-serif; }.weekday-picker .weekday-active { border-color: var(--coral); background: #faece7; color: #bd624f; }
