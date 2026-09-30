@@ -84,6 +84,21 @@ export type WeeklyAvailability = {
   ends: string;
 };
 
+export type WeeklyAvailabilityOverride = {
+  id?: string;
+  weekStart: string;
+  intervals: WeeklyAvailability[];
+};
+
+export type WeeklyAvailabilityByWeek = Record<string, WeeklyAvailabilityOverride>;
+
+export type WeeklyAvailabilitySource = "default" | "override";
+
+export type ResolvedWeeklyAvailability = {
+  intervals: WeeklyAvailability[];
+  source: WeeklyAvailabilitySource;
+};
+
 export type WeeklyWorkingPlace = {
   id?: string;
   weekday: number;

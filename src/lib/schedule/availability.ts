@@ -1,5 +1,5 @@
-import { addDays, dateKey } from "./dates";
-import type { CalendarRange, ScheduleOccurrence, StaminaState, SuggestedSlot, WeeklyAvailability, WorkingPlacesByWeekday } from "./types";
+import { addDays, dateFromKey, dateKey, startOfWeek } from "./dates";
+import type { CalendarRange, ResolvedWeeklyAvailability, ScheduleOccurrence, StaminaState, SuggestedSlot, WeeklyAvailability, WeeklyAvailabilityOverride, WorkingPlacesByWeekday } from "./types";
 
 type BusyOccurrence = Pick<ScheduleOccurrence, "startsAt" | "endsAt">;
 
@@ -20,6 +20,34 @@ export type AvailabilityConflict = {
 
 export const practicalAvailabilityStart = 8 * 60;
 export const practicalAvailabilityEnd = 20 * 60;
+export const weeklyAvailabilityStorageKey = "daylight-weekly-availability";
+export const weeklyAvailabilityOverridesStorageKey = "daylight-weekly-availability-overrides";
+
+export function weekStartKey(date: Date | string) {
+  const source = typeof date === "string" ? dateFromKey(date) : date;
+  return dateKey(startOfWeek(source));
+}
+
+export function weeklyAvailabilityOverrideStorageKey(weekStart: string) {
+  return `${weeklyAvailabilityOverridesStorageKey}-${weekStartKey(weekStart)}`;
+}
+
+export function resolveWeeklyAvailability(defaultIntervals: WeeklyAvailability[], override?: WeeklyAvailabilityOverride): ResolvedWeeklyAvailability {
+  return {
+    intervals: normalizeWeeklyAvailability(override ? override.intervals : defaultIntervals),
+    source: override ? "override" : "default",
+  };
+}
+
+export function parseWeeklyAvailabilityOverride(value: unknown, weekStart: string): WeeklyAvailabilityOverride | null {
+  if (!Array.isArray(value)) return null;
+  const intervals = value.filter((item): item is WeeklyAvailability => {
+    if (!item || typeof item !== "object") return false;
+    const candidate = item as Partial<WeeklyAvailability>;
+    return Number.isInteger(candidate.weekday) && typeof candidate.starts === "string" && typeof candidate.ends === "string";
+  });
+  return { weekStart: weekStartKey(weekStart), intervals: normalizeWeeklyAvailability(intervals) };
+}
 
 export function lessonHours(occurrences: Pick<ScheduleOccurrence, "startsAt" | "endsAt" | "kind">[]) {
   return occurrences

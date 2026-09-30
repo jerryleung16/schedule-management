@@ -25,11 +25,11 @@ import {
   X,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
-import { availabilityConflicts, formatWeeklyAvailabilityMessage, lessonHours, normalizeWeeklyAvailability, occupiedAvailabilityByWeekday, practicalFreeSlots, slotConflicts, staminaState, validateWeeklyAvailability } from "@/lib/schedule/availability";
+import { availabilityConflicts, formatWeeklyAvailabilityMessage, lessonHours, normalizeWeeklyAvailability, occupiedAvailabilityByWeekday, parseWeeklyAvailabilityOverride, practicalFreeSlots, resolveWeeklyAvailability, slotConflicts, staminaState, validateWeeklyAvailability, weekStartKey, weeklyAvailabilityOverrideStorageKey, weeklyAvailabilityStorageKey } from "@/lib/schedule/availability";
 import { addDays, dateFromKey, dateKey, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
 import { normalizeWeeklyWorkingPlaces, workingPlaceStorageKey, workingPlacesToMap } from "@/lib/schedule/workplaces";
-import type { EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, Student, WeeklyAvailability, WeeklyWorkingPlace, WorkingPlacesByWeekday } from "@/lib/schedule/types";
+import type { EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, Student, WeeklyAvailability, WeeklyAvailabilityByWeek, WeeklyAvailabilitySource, WeeklyWorkingPlace, WorkingPlacesByWeekday } from "@/lib/schedule/types";
 
 type IconComponent = typeof LayoutDashboard;
 
@@ -51,7 +51,6 @@ type Lesson = {
 
 const storageKey = "daylight-lessons";
 const scheduleChangedEvent = "daylight-schedule-changed";
-const availabilityStorageKey = "daylight-weekly-availability";
 const scheduleDate = new Date().toISOString().slice(0, 10);
 const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const eventTones: EventTone[] = ["blue", "coral", "teal", "yellow", "violet"];
@@ -323,13 +322,18 @@ export default function Home() {
   const [monthlyCompletedCount, setMonthlyCompletedCount] = useState(0);
   const [weeklyLessonHours, setWeeklyLessonHours] = useState(0);
   const [weeklyOccurrences, setWeeklyOccurrences] = useState<ScheduleOccurrence[]>([]);
+  const [availabilityWeekDate, setAvailabilityWeekDate] = useState(scheduleDate);
   const [editingLesson, setEditingLesson] = useState<Lesson | null>(null);
   const [lessonFormDate, setLessonFormDate] = useState(selectedDate);
   const [lessonModalOpen, setLessonModalOpen] = useState(false);
   const [lessonDetailsOpen, setLessonDetailsOpen] = useState(false);
   const [lessonDeleteConfirmOpen, setLessonDeleteConfirmOpen] = useState(false);
   const [lessonFormError, setLessonFormError] = useState("");
+  const [availabilityDefault, setAvailabilityDefault] = useState<WeeklyAvailability[]>([]);
+  const [availabilityOverrides, setAvailabilityOverrides] = useState<WeeklyAvailabilityByWeek>({});
   const [availability, setAvailability] = useState<WeeklyAvailability[]>([]);
+  const [availabilitySource, setAvailabilitySource] = useState<WeeklyAvailabilitySource>("default");
+  const [availabilityEditMode, setAvailabilityEditMode] = useState<"week" | "default">("week");
   const [workingPlaces, setWorkingPlaces] = useState<WorkingPlacesByWeekday>({});
   const [availabilityMessage, setAvailabilityMessage] = useState("");
   const [availabilityError, setAvailabilityError] = useState("");
@@ -337,6 +341,8 @@ export default function Home() {
   const [calculatorValue, setCalculatorValue] = useState("128 / 4");
   const [calculatorResult, setCalculatorResult] = useState("32");
   const [calculatorError, setCalculatorError] = useState("");
+
+  const selectedAvailabilityWeekStart = weekStartKey(availabilityWeekDate);
 
   useEffect(() => {
     const refresh = () => setScheduleRefreshVersion((current) => current + 1);
@@ -400,7 +406,7 @@ export default function Home() {
         const payableLessons = monthLessons.filter((lesson) => lesson.kind === "lesson" && lesson.status !== "cancelled" && lesson.status !== "skipped");
         setMonthlyCompletedCount(payableLessons.length);
         setMonthlyCompletedEarnings(payableLessons.reduce((total, lesson) => total + ((minutesFromTime(lesson.end) - minutesFromTime(lesson.time)) / 60) * lesson.rate, 0));
-        const localRange = rangeForView(dateFromKey(selectedDate), "week");
+        const localRange = rangeForView(dateFromKey(availabilityWeekDate), "week");
         const localOccurrences: ScheduleOccurrence[] = [];
         for (let day = new Date(localRange.start); day < localRange.end; day = addDays(day, 1)) {
           const dayLessons = day.getTime() === dateFromKey(selectedDate).getTime()
@@ -466,7 +472,7 @@ export default function Home() {
         setMonthlyCompletedCount(0);
         setMonthlyCompletedEarnings(0);
       }
-      const weekRange = rangeForView(selectedMonth, "week");
+      const weekRange = rangeForView(dateFromKey(availabilityWeekDate), "week");
       const weekStart = weekRange.start;
       const weekEnd = weekRange.end;
       const canonicalWeek = await supabase
@@ -520,14 +526,40 @@ export default function Home() {
 
     const loadTimer = window.setTimeout(() => { void loadLessons(); }, 0);
     return () => window.clearTimeout(loadTimer);
-  }, [scheduleRefreshVersion, selectedDate]);
+  }, [scheduleRefreshVersion, selectedDate, availabilityWeekDate]);
 
   useEffect(() => {
     if (supabaseConfigured && !userId) return;
     let cancelled = false;
     const loadAvailability = async () => {
-      let loaded: WeeklyAvailability[] = [];
+      let loadedDefault: WeeklyAvailability[] = [];
+      let loadedOverrides: WeeklyAvailabilityByWeek = {};
       let loadedWorkingPlaces: WeeklyWorkingPlace[] = [];
+      const loadLocalDefault = () => {
+        const stored = window.localStorage.getItem(weeklyAvailabilityStorageKey);
+        if (!stored) return;
+        try {
+          loadedDefault = JSON.parse(stored) as WeeklyAvailability[];
+        } catch {
+          window.localStorage.removeItem(weeklyAvailabilityStorageKey);
+        }
+      };
+      const loadLocalOverrides = () => {
+        const overrides: WeeklyAvailabilityByWeek = {};
+        const monthRange = rangeForView(dateFromKey(availabilityWeekDate), "month");
+        for (let day = new Date(monthRange.start); day < monthRange.end; day = addDays(day, 7)) {
+          const weekStart = weekStartKey(day);
+          const stored = window.localStorage.getItem(weeklyAvailabilityOverrideStorageKey(weekStart));
+          if (stored === null) continue;
+          try {
+            const parsed = parseWeeklyAvailabilityOverride(JSON.parse(stored), weekStart);
+            if (parsed) overrides[weekStart] = parsed;
+          } catch {
+            window.localStorage.removeItem(weeklyAvailabilityOverrideStorageKey(weekStart));
+          }
+        }
+        loadedOverrides = overrides;
+      };
       const loadLocalWorkingPlaces = () => {
         const stored = window.localStorage.getItem(workingPlaceStorageKey);
         if (!stored) return;
@@ -539,23 +571,35 @@ export default function Home() {
         }
       };
       if (!supabaseConfigured) {
-        const stored = window.localStorage.getItem(availabilityStorageKey);
-        if (stored) {
-          try { loaded = JSON.parse(stored) as WeeklyAvailability[]; } catch { window.localStorage.removeItem(availabilityStorageKey); }
-        }
+        loadLocalDefault();
+        loadLocalOverrides();
         loadLocalWorkingPlaces();
       } else {
-        const { data, error } = await createClient().from("weekly_availability").select("id, weekday, starts, ends").eq("user_id", userId).order("weekday").order("starts");
+        const supabase = createClient();
+        const { data, error } = await supabase.from("weekly_availability").select("id, weekday, starts, ends").eq("user_id", userId).order("weekday").order("starts");
         if (error) {
-          const stored = window.localStorage.getItem(availabilityStorageKey);
-          if (stored) {
-            try { loaded = JSON.parse(stored) as WeeklyAvailability[]; } catch { window.localStorage.removeItem(availabilityStorageKey); }
-          }
+          loadLocalDefault();
           if (!cancelled) setAvailabilityError("Cloud availability is not ready yet; local availability is being used.");
         } else {
-          loaded = (data ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), starts: String(row.starts).slice(0, 5), ends: String(row.ends).slice(0, 5) }));
+          loadedDefault = (data ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), starts: String(row.starts).slice(0, 5), ends: String(row.ends).slice(0, 5) }));
         }
-        const { data: workingPlaceData, error: workingPlaceError } = await createClient().from("weekly_working_places").select("id, weekday, place").eq("user_id", userId).order("weekday");
+        const monthRange = rangeForView(dateFromKey(availabilityWeekDate), "month");
+        const { data: overrideData, error: overrideError } = await supabase
+          .from("weekly_availability_overrides")
+          .select("id, week_start, intervals")
+          .eq("user_id", userId)
+          .gte("week_start", dateKey(monthRange.start))
+          .lt("week_start", dateKey(monthRange.end));
+        if (overrideError) {
+          loadLocalOverrides();
+          if (!cancelled) setAvailabilityError("Week-specific availability is not ready yet; local week values are being used.");
+        } else {
+          loadedOverrides = Object.fromEntries((overrideData ?? []).flatMap((row) => {
+            const parsed = parseWeeklyAvailabilityOverride(row.intervals, String(row.week_start));
+            return parsed ? [[parsed.weekStart, { id: String(row.id), ...parsed }]] : [];
+          }));
+        }
+        const { data: workingPlaceData, error: workingPlaceError } = await supabase.from("weekly_working_places").select("id, weekday, place").eq("user_id", userId).order("weekday");
         if (workingPlaceError) {
           loadLocalWorkingPlaces();
           if (!cancelled) setAvailabilityError("Cloud availability or workplaces are not ready yet; local values are being used.");
@@ -564,16 +608,23 @@ export default function Home() {
         }
       }
       if (!cancelled) {
-        const normalized = normalizeWeeklyAvailability(loaded);
+        const normalizedDefault = normalizeWeeklyAvailability(loadedDefault);
+        const normalizedOverrides = Object.fromEntries(Object.entries(loadedOverrides).map(([weekStart, override]) => [weekStart, { ...override, intervals: normalizeWeeklyAvailability(override.intervals) }]));
         const normalizedWorkingPlaces = workingPlacesToMap(normalizeWeeklyWorkingPlaces(loadedWorkingPlaces));
-        setAvailability(normalized);
+        const resolved = availabilityEditMode === "default"
+          ? { intervals: normalizedDefault, source: "default" as const }
+          : resolveWeeklyAvailability(normalizedDefault, normalizedOverrides[selectedAvailabilityWeekStart]);
+        setAvailabilityDefault(normalizedDefault);
+        setAvailabilityOverrides(normalizedOverrides);
+        setAvailability(resolved.intervals);
+        setAvailabilitySource(resolved.source);
         setWorkingPlaces(normalizedWorkingPlaces);
-        setAvailabilityMessage(formatWeeklyAvailabilityMessage(normalized, normalizedWorkingPlaces));
+        setAvailabilityMessage(formatWeeklyAvailabilityMessage(resolved.intervals, normalizedWorkingPlaces));
       }
     };
     void loadAvailability();
     return () => { cancelled = true; };
-  }, [userId]);
+  }, [availabilityEditMode, availabilityWeekDate, selectedAvailabilityWeekStart, userId]);
 
   useEffect(() => {
     if (hasLoadedLessons.current && !supabaseConfigured) {
@@ -612,6 +663,61 @@ export default function Home() {
     updateAvailability([...availability, slot]);
   };
 
+  const changeAvailabilityEditMode = (mode: "week" | "default") => {
+    const resolved = mode === "default"
+      ? { intervals: availabilityDefault, source: "default" as const }
+      : resolveWeeklyAvailability(availabilityDefault, availabilityOverrides[selectedAvailabilityWeekStart]);
+    setAvailabilityEditMode(mode);
+    setAvailability(resolved.intervals);
+    setAvailabilitySource(resolved.source);
+    setAvailabilityMessage(formatWeeklyAvailabilityMessage(resolved.intervals, workingPlaces));
+    setAvailabilityError("");
+  };
+
+  const moveAvailabilityWeek = (amount: number) => {
+    setAvailabilityWeekDate(dateKey(addDays(dateFromKey(selectedAvailabilityWeekStart), amount * 7)));
+  };
+
+  const saveLocalWorkingPlaces = () => {
+    window.localStorage.setItem(workingPlaceStorageKey, JSON.stringify(workingPlaces));
+  };
+
+  const revertAvailabilityToDefault = async () => {
+    if (availabilityEditMode !== "week" || !availabilityOverrides[selectedAvailabilityWeekStart]) return;
+    setAvailabilitySaving(true);
+    setAvailabilityError("");
+    if (!supabaseConfigured) {
+      window.localStorage.removeItem(weeklyAvailabilityOverrideStorageKey(selectedAvailabilityWeekStart));
+      const nextOverrides = { ...availabilityOverrides };
+      delete nextOverrides[selectedAvailabilityWeekStart];
+      setAvailabilityOverrides(nextOverrides);
+      setAvailability(availabilityDefault);
+      setAvailabilitySource("default");
+      setAvailabilityMessage(formatWeeklyAvailabilityMessage(availabilityDefault, workingPlaces));
+      setAvailabilitySaving(false);
+      showNotice("This week now uses the recurring default.");
+      return;
+    }
+    if (!userId) {
+      setAvailabilitySaving(false);
+      setAvailabilityError("Your session is still loading. Try again in a moment.");
+      return;
+    }
+    const { error } = await createClient().from("weekly_availability_overrides").delete().eq("user_id", userId).eq("week_start", selectedAvailabilityWeekStart);
+    setAvailabilitySaving(false);
+    if (error) {
+      setAvailabilityError("The week could not be reverted. Your existing values are unchanged.");
+      return;
+    }
+    const nextOverrides = { ...availabilityOverrides };
+    delete nextOverrides[selectedAvailabilityWeekStart];
+    setAvailabilityOverrides(nextOverrides);
+    setAvailability(availabilityDefault);
+    setAvailabilitySource("default");
+    setAvailabilityMessage(formatWeeklyAvailabilityMessage(availabilityDefault, workingPlaces));
+    showNotice("This week now uses the recurring default.");
+  };
+
   const saveAvailability = async () => {
     const validationError = validateWeeklyAvailability(availability);
     if (validationError) {
@@ -625,10 +731,20 @@ export default function Home() {
     setAvailabilitySaving(true);
     setAvailabilityError("");
     if (!supabaseConfigured) {
-      window.localStorage.setItem(availabilityStorageKey, JSON.stringify(availability));
-      window.localStorage.setItem(workingPlaceStorageKey, JSON.stringify(workingPlaces));
+      if (availabilityEditMode === "default") {
+        window.localStorage.setItem(weeklyAvailabilityStorageKey, JSON.stringify(availability));
+        setAvailabilityDefault(availability);
+      } else {
+        window.localStorage.setItem(weeklyAvailabilityOverrideStorageKey(selectedAvailabilityWeekStart), JSON.stringify(availability));
+        setAvailabilityOverrides({
+          ...availabilityOverrides,
+          [selectedAvailabilityWeekStart]: { weekStart: selectedAvailabilityWeekStart, intervals: availability },
+        });
+        setAvailabilitySource("override");
+      }
+      saveLocalWorkingPlaces();
       setAvailabilitySaving(false);
-      showNotice("Weekly availability saved in this browser.");
+      showNotice(availabilityEditMode === "default" ? "Recurring availability saved in this browser." : "This week's availability saved in this browser.");
       return;
     }
     if (!userId) {
@@ -637,14 +753,15 @@ export default function Home() {
       return;
     }
     const supabase = createClient();
-    const { error: deleteError } = await supabase.from("weekly_availability").delete().eq("user_id", userId);
-    const { error: insertError } = deleteError
-      ? { error: deleteError }
-      : availability.length
-        ? await supabase.from("weekly_availability").insert(availability.map((interval) => ({ user_id: userId, weekday: interval.weekday, starts: interval.starts, ends: interval.ends })))
-        : { error: null };
-    const { error: workingPlaceDeleteError } = insertError
-      ? { error: insertError }
+    const availabilityResult = availabilityEditMode === "default"
+      ? await supabase.from("weekly_availability").delete().eq("user_id", userId).then(async ({ error: deleteError }) => deleteError
+        ? { error: deleteError }
+        : availability.length
+          ? await supabase.from("weekly_availability").insert(availability.map((interval) => ({ user_id: userId, weekday: interval.weekday, starts: interval.starts, ends: interval.ends })))
+          : { error: null })
+      : await supabase.from("weekly_availability_overrides").upsert({ user_id: userId, week_start: selectedAvailabilityWeekStart, intervals: availability }, { onConflict: "user_id,week_start" });
+    const { error: workingPlaceDeleteError } = availabilityResult.error
+      ? { error: availabilityResult.error }
       : await supabase.from("weekly_working_places").delete().eq("user_id", userId);
     const workingPlaceRows = Object.entries(workingPlaces)
       .filter(([, place]) => Boolean(place?.trim()))
@@ -655,13 +772,22 @@ export default function Home() {
         ? await supabase.from("weekly_working_places").insert(workingPlaceRows)
         : { error: null };
     setAvailabilitySaving(false);
-    if (insertError || workingPlaceInsertError) {
-      window.localStorage.setItem(availabilityStorageKey, JSON.stringify(availability));
-      window.localStorage.setItem(workingPlaceStorageKey, JSON.stringify(workingPlaces));
+    if (availabilityResult.error || workingPlaceInsertError) {
+      if (availabilityEditMode === "default") window.localStorage.setItem(weeklyAvailabilityStorageKey, JSON.stringify(availability));
+      else window.localStorage.setItem(weeklyAvailabilityOverrideStorageKey(selectedAvailabilityWeekStart), JSON.stringify(availability));
+      saveLocalWorkingPlaces();
       setAvailabilityError("Cloud availability is not ready yet; your changes are saved in this browser.");
       return;
     }
-    showNotice("Weekly availability saved to the cloud.");
+    if (availabilityEditMode === "default") setAvailabilityDefault(availability);
+    else {
+      setAvailabilityOverrides({
+        ...availabilityOverrides,
+        [selectedAvailabilityWeekStart]: { weekStart: selectedAvailabilityWeekStart, intervals: availability },
+      });
+      setAvailabilitySource("override");
+    }
+    showNotice(availabilityEditMode === "default" ? "Recurring availability saved to the cloud." : "This week's availability saved to the cloud.");
   };
 
   const copyAvailabilityMessage = async () => {
@@ -677,10 +803,14 @@ export default function Home() {
   const availabilityConflictsError = availabilityConflictsList.length
     ? `${availabilityConflictsList[0].eventTitle} overlaps ${availabilityConflictsList[0].starts}–${availabilityConflictsList[0].ends} on ${weekdayNames[availabilityConflictsList[0].weekday]}.`
     : "";
-  const selectedMonth = dateFromKey(selectedDate);
+  const selectedMonth = dateFromKey(availabilityWeekDate);
   const monthStart = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), 1, 12);
   const monthEnd = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() + 1, 1, 12);
   const monthOverviewDays = Array.from({ length: Math.round((monthEnd.getTime() - monthStart.getTime()) / 86400000) }, (_, index) => addDays(monthStart, index));
+  const selectedAvailabilityWeekEnd = addDays(dateFromKey(selectedAvailabilityWeekStart), 6);
+  const availabilityIntervalsForWeek = (weekStart: string) => weekStart === selectedAvailabilityWeekStart
+    ? availability
+    : availabilityOverrides[weekStart]?.intervals ?? availabilityDefault;
 
   const focusSection = (label: string, section: HTMLElement | null) => {
     setActiveNav(label);
@@ -974,12 +1104,13 @@ export default function Home() {
 
           </div>
           <section className="panel availability-panel" aria-labelledby="availability-title">
-            <div className="panel-heading"><div><p className="section-kicker">Client-ready rhythm</p><h2 id="availability-title">Weekly availability</h2></div><Clock3 size={20} className="panel-icon" /></div>
+            <div className="panel-heading availability-panel-heading"><div><p className="section-kicker">Client-ready rhythm</p><h2 id="availability-title">Weekly availability</h2></div><div className="availability-week-controls"><button type="button" className="round-button" aria-label="Previous availability week" title="Previous week" onClick={() => moveAvailabilityWeek(-1)}><ChevronLeft size={16} /></button><span><strong>{dateFromKey(selectedAvailabilityWeekStart).toLocaleDateString("en-US", { month: "short", day: "numeric" })}–{selectedAvailabilityWeekEnd.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</strong><small>{availabilityEditMode === "default" ? "Recurring default" : availabilitySource === "override" ? "Custom week" : "Using recurring default"}</small></span><button type="button" className="round-button" aria-label="Next availability week" title="Next week" onClick={() => moveAvailabilityWeek(1)}><ChevronRight size={16} /></button><button type="button" className="text-button" onClick={() => setAvailabilityWeekDate(scheduleDate)}>Current week</button><Clock3 size={20} className="panel-icon" /></div></div>
             <div className="availability-content">
-              <p className="availability-intro">Set recurring teaching windows from the unoccupied periods in your selected week.</p>
-              <div className="availability-days">{[1, 2, 3, 4, 5, 6, 0].map((weekday) => { const day = addDays(rangeForView(dateFromKey(selectedDate), "week").start, (weekday + 6) % 7); const dayKey = dateKey(day); const occupied = occupiedAvailabilityByWeekday(weeklyOccurrences).filter((item) => item.weekday === weekday && item.eventDate === dayKey); const freeSlots = practicalFreeSlots(weeklyOccurrences).filter((slot) => slot.weekday === weekday); return <div className="availability-day" key={weekday}><div className="availability-day-heading"><div><strong>{weekdayNames[weekday]}</strong><span className="availability-date">{day.toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span></div><button type="button" className="text-button" onClick={() => addAvailabilityWindow(weekday)}><Plus size={13} /> Add window</button></div><label className="availability-place"><span>Working place</span><input aria-label={`${weekdayNames[weekday]} working place`} value={workingPlaces[weekday] ?? ""} onChange={(event) => updateWorkingPlace(weekday, event.target.value)} placeholder="e.g. CWB" maxLength={120} /></label><div className="availability-occupied">{occupied.length ? occupied.map((item) => <span key={`${item.startsAt}-${item.endsAt}-${item.eventDate}`}>{item.title} · {String(Math.floor(item.starts / 60)).padStart(2, "0")}:{String(item.starts % 60).padStart(2, "0")}–{String(Math.floor(item.ends / 60)).padStart(2, "0")}:{String(item.ends % 60).padStart(2, "0")}</span>) : <span>No scheduled blocks</span>}</div><div className="availability-free-heading">Free time · 08:00–20:00</div>{freeSlots.length ? freeSlots.map((slot) => <div className="availability-free-slot" key={`${slot.starts}-${slot.ends}`}><span>{slot.starts}–{slot.ends}</span><button type="button" className="text-button" onClick={() => addFreeAvailabilitySlot(slot)}><Plus size={13} /> Use</button></div>) : <p className="availability-no-free">No free time in this range.</p>}{availability.map((interval, index) => interval.weekday === weekday && <div className="availability-window" key={`${interval.weekday}-${index}`}><input aria-label={`${weekdayNames[weekday]} start`} type="time" value={interval.starts} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, starts: event.target.value } : item))} /><span>to</span><input aria-label={`${weekdayNames[weekday]} end`} type="time" value={interval.ends} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, ends: event.target.value } : item))} /><button type="button" className="icon-button availability-remove" aria-label="Remove availability window" onClick={() => removeAvailabilityWindow(index)}><X size={14} /></button></div>)}</div>; })}</div>
-              <div className="availability-month-heading"><div><span className="form-field-label">Month overview</span><strong>{selectedMonth.toLocaleDateString("en-US", { month: "long", year: "numeric" })}</strong></div><span>Recurring weekly pattern</span></div>
-              <div className="availability-month-grid">{monthOverviewDays.map((day) => { const weekday = day.getDay(); const dayIntervals = availability.filter((interval) => interval.weekday === weekday); return <div className="availability-month-day" key={dateKey(day)}><div><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong>{day.getDate()}</strong></div>{dayIntervals.length ? <p>{dayIntervals.map((interval) => `${interval.starts}–${interval.ends}`).join(", ")}</p> : <p className="availability-month-empty">No window</p>}{workingPlaces[weekday] && <small>{workingPlaces[weekday]}</small>}</div>; })}</div>
+              <p className="availability-intro">Set the Monday-Sunday teaching windows for the selected week. Untouched weeks use the recurring default.</p>
+              <div className="availability-mode-bar"><span className={`availability-status availability-status-${availabilitySource}`}>{availabilityEditMode === "default" ? "Editing recurring default" : availabilitySource === "override" ? "Custom schedule for this week" : "Inherited from recurring default"}</span><div>{availabilityEditMode === "default" ? <button type="button" className="secondary-button" onClick={() => changeAvailabilityEditMode("week")}>Edit selected week</button> : <button type="button" className="secondary-button" onClick={() => changeAvailabilityEditMode("default")}>Edit recurring default</button>}{availabilityEditMode === "week" && availabilitySource === "override" && <button type="button" className="text-button" onClick={() => void revertAvailabilityToDefault()} disabled={availabilitySaving}>Revert to default</button>}</div></div>
+              <div className="availability-days">{[1, 2, 3, 4, 5, 6, 0].map((weekday) => { const day = addDays(dateFromKey(selectedAvailabilityWeekStart), (weekday + 6) % 7); const dayKey = dateKey(day); const occupied = occupiedAvailabilityByWeekday(weeklyOccurrences).filter((item) => item.weekday === weekday && item.eventDate === dayKey); const freeSlots = practicalFreeSlots(weeklyOccurrences).filter((slot) => slot.weekday === weekday); return <div className="availability-day" key={weekday}><div className="availability-day-heading"><div><strong>{weekdayNames[weekday]}</strong><span className="availability-date">{day.toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span></div><button type="button" className="text-button" onClick={() => addAvailabilityWindow(weekday)}><Plus size={13} /> Add window</button></div><label className="availability-place"><span>Working place</span><input aria-label={`${weekdayNames[weekday]} working place`} value={workingPlaces[weekday] ?? ""} onChange={(event) => updateWorkingPlace(weekday, event.target.value)} placeholder="e.g. CWB" maxLength={120} /></label><div className="availability-occupied">{occupied.length ? occupied.map((item) => <span key={`${item.startsAt}-${item.endsAt}-${item.eventDate}`}>{item.title} · {String(Math.floor(item.starts / 60)).padStart(2, "0")}:{String(item.starts % 60).padStart(2, "0")}–{String(Math.floor(item.ends / 60)).padStart(2, "0")}:{String(item.ends % 60).padStart(2, "0")}</span>) : <span>No scheduled blocks</span>}</div><div className="availability-free-heading">Free time · 08:00–20:00</div>{freeSlots.length ? freeSlots.map((slot) => <div className="availability-free-slot" key={`${slot.starts}-${slot.ends}`}><span>{slot.starts}–{slot.ends}</span><button type="button" className="text-button" onClick={() => addFreeAvailabilitySlot(slot)}><Plus size={13} /> Use</button></div>) : <p className="availability-no-free">No free time in this range.</p>}{availability.map((interval, index) => interval.weekday === weekday && <div className="availability-window" key={`${interval.weekday}-${index}`}><input aria-label={`${weekdayNames[weekday]} start`} type="time" value={interval.starts} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, starts: event.target.value } : item))} /><span>to</span><input aria-label={`${weekdayNames[weekday]} end`} type="time" value={interval.ends} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, ends: event.target.value } : item))} /><button type="button" className="icon-button availability-remove" aria-label="Remove availability window" onClick={() => removeAvailabilityWindow(index)}><X size={14} /></button></div>)}</div>; })}</div>
+              <div className="availability-month-heading"><div><span className="form-field-label">Month overview</span><strong>{selectedMonth.toLocaleDateString("en-US", { month: "long", year: "numeric" })}</strong></div><span>Week-specific projection</span></div>
+              <div className="availability-month-grid">{monthOverviewDays.map((day) => { const weekday = day.getDay(); const dayIntervals = availabilityIntervalsForWeek(weekStartKey(day)).filter((interval) => interval.weekday === weekday); return <div className="availability-month-day" key={dateKey(day)}><div><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong>{day.getDate()}</strong></div>{dayIntervals.length ? <p>{dayIntervals.map((interval) => `${interval.starts}–${interval.ends}`).join(", ")}</p> : <p className="availability-month-empty">No window</p>}{workingPlaces[weekday] && <small>{workingPlaces[weekday]}</small>}</div>; })}</div>
               {availabilityError && <p className="form-error" role="alert">{availabilityError}</p>}
               {availabilityConflictsError && <p className="availability-conflict" role="alert">{availabilityConflictsError} Remove or adjust the window before saving.</p>}
               <div className="availability-actions"><button type="button" className="primary-button" onClick={() => void saveAvailability()} disabled={availabilitySaving || Boolean(validateWeeklyAvailability(availability)) || Boolean(availabilityConflictsError)}><Save size={15} /> {availabilitySaving ? "Saving..." : "Save availability"}</button></div>
