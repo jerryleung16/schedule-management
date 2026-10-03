@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
+import { deleteGoogleCalendarEvent, syncGoogleCalendarEvent } from "@/lib/google-calendar/client";
 import { availabilityConflicts, formatWeeklyAvailabilityMessage, lessonHours, normalizeWeeklyAvailability, occupiedAvailabilityByWeekday, parseWeeklyAvailabilityOverride, practicalFreeSlots, resolveWeeklyAvailability, slotConflicts, staminaState, validateWeeklyAvailability, weekStartKey, weeklyAvailabilityOverrideStorageKey, weeklyAvailabilityStorageKey } from "@/lib/schedule/availability";
 import { addDays, dateFromKey, dateKey, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
@@ -636,6 +637,17 @@ export default function Home() {
     setNotice(message);
   };
 
+  const syncOverviewEvent = async (lesson: Lesson, date: string, deleted = false) => {
+    const syncUserId = userId || "local";
+    const event = scheduleEventFromRow(lessonToScheduleRow(lesson, syncUserId, date), syncUserId);
+    try {
+      const result = deleted ? await deleteGoogleCalendarEvent(event) : await syncGoogleCalendarEvent(event);
+      if (result === "synced") showNotice("Google Calendar updated.");
+    } catch (syncError) {
+      setDataError(`The schedule was saved, but Google Calendar sync failed: ${syncError instanceof Error ? syncError.message : "unknown error"}`);
+    }
+  };
+
   const updateAvailability = (next: WeeklyAvailability[]) => {
     const normalized = normalizeWeeklyAvailability(next);
     setAvailability(normalized);
@@ -962,6 +974,7 @@ export default function Home() {
       : [...current, lesson]);
     setLessonModalOpen(false);
     setEditingLesson(null);
+    await syncOverviewEvent(lesson, lessonFormDate);
   };
 
   const deleteLesson = async () => {
@@ -985,6 +998,7 @@ export default function Home() {
     setLessonDeleteConfirmOpen(false);
     setEditingLesson(null);
     notifyScheduleChanged();
+    await syncOverviewEvent(editingLesson, lessonFormDate, true);
   };
 
   const signOut = async () => {

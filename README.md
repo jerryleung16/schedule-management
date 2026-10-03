@@ -16,15 +16,12 @@ The first implementation is a responsive dashboard prototype with:
 - Add and edit schedule blocks with time validation, intensity, preparation, and travel inputs.
 - Delete schedule blocks and keep changes in browser localStorage between visits.
 - Live weekly teaching-hour summaries based on the current schedule.
-- Supabase SSR authentication and cloud lesson persistence when environment variables are configured.
+- Optional one-way Google Calendar event synchronization from the calendar workspace.
 - A mobile navigation layout and desktop sidebar.
 
 Without Supabase variables, the app runs in local demo mode. With Supabase configured, login is required and lesson add/edit/delete operations are stored in the authenticated user's database rows.
 
 ## Run locally
-
-Install dependencies and start the development server:
-
 ```bash
 npm install
 npm run dev
@@ -52,6 +49,19 @@ NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
 
 Then add your local and production URLs under Supabase Authentication > URL Configuration.
 
+## Enable Google Calendar sync
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), enable the Google Calendar API.
+2. Create an OAuth client ID for a web application.
+3. Add `http://localhost:3000`, `http://localhost:3001`, your deployed site origin, and any other development origin under Authorized JavaScript origins.
+4. Add the client ID to `.env.local`:
+
+```env
+NEXT_PUBLIC_GOOGLE_CLIENT_ID=your-web-application-client-id.apps.googleusercontent.com
+```
+
+Google Calendar sync runs in the browser so it works with the static GitHub Pages deployment. Daylight requests the Calendar events scope and only creates, updates, or removes events that Daylight owns. It never imports Google Calendar events or applies Google-side edits back to the schedule. Access tokens stay in the browser session and can be revoked from Settings by disconnecting the calendar.
+
 ## Validate
 
 ```bash
@@ -74,6 +84,7 @@ For cloud persistence and authentication, add these repository variables under *
 ```env
 NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
 NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
+NEXT_PUBLIC_GOOGLE_CLIENT_ID=your-web-application-client-id.apps.googleusercontent.com
 ```
 
 GitHub Pages is a static host, so the server-side Supabase proxy is not available there. The dashboard and calendar retain their client-side authentication checks and use the public Supabase publishable key. Add the Pages URL under Supabase Authentication > URL Configuration.
@@ -87,4 +98,4 @@ GitHub Pages is a static host, so the server-side Supabase proxy is not availabl
 - Hourly and fixed lesson rates, with completed lessons contributing to actual earnings.
 - Recurring lessons with reschedule, skip, and cancellation exceptions.
 
-External calendar synchronization, tax calculation, invoicing, and payment reconciliation are intentionally outside the first release.
+Tax calculation, invoicing, and payment reconciliation are intentionally outside the first release.

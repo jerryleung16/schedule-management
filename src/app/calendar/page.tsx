@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { CalendarDays, ChevronLeft, ChevronRight, Clock3, Plus, Sparkles, X } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
+import { deleteGoogleCalendarEvent, syncGoogleCalendarEvent, syncGoogleCalendarOccurrence } from "@/lib/google-calendar/client";
 import { slotConflicts } from "@/lib/schedule/availability";
 import { addDays, dateKey, dateFromKey, formatRangeLabel, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
@@ -184,6 +185,24 @@ export default function CalendarPage() {
   const days = Array.from({ length: view === "day" ? 1 : view === "week" ? 7 : Math.round((range.end.getTime() - range.start.getTime()) / 86400000) }, (_, index) => addDays(range.start, index));
 
   const studentName = (studentId: string | null) => studentDirectory.find((student) => student.id === studentId)?.name ?? "No student linked";
+
+  const syncSavedEvent = async (event: ScheduleEvent) => {
+    try {
+      const result = await syncGoogleCalendarEvent(event);
+      if (result === "synced") setNotice((current) => `${current} Google Calendar updated.`);
+    } catch (syncError) {
+      setError(`The schedule was saved, but Google Calendar sync failed: ${syncError instanceof Error ? syncError.message : "unknown error"}`);
+    }
+  };
+
+  const syncDeletedEvent = async (event: ScheduleEvent) => {
+    try {
+      const result = await deleteGoogleCalendarEvent(event);
+      if (result === "synced") setNotice((current) => `${current} Google Calendar updated.`);
+    } catch (syncError) {
+      setError(`The schedule was changed, but Google Calendar sync failed: ${syncError instanceof Error ? syncError.message : "unknown error"}`);
+    }
+  };
 
   useEffect(() => {
     if (!hydrated) return;
@@ -395,17 +414,20 @@ export default function CalendarPage() {
         try { targetLessons = JSON.parse(targetStored) as Array<Record<string, unknown>>; } catch { }
       }
       window.localStorage.setItem(`${storageKey}-${targetKey}`, JSON.stringify([...targetLessons.filter((lesson) => String(lesson.id) !== id), localLesson]));
-      setEvents((current) => [...current.filter((item) => item.id !== id), localEventFromLesson(localLesson, targetKey)]);
+      const savedLocalEvent = localEventFromLesson(localLesson, targetKey);
+      setEvents((current) => [...current.filter((item) => item.id !== id), savedLocalEvent]);
       setNotice(editingOccurrence ? "Event updated." : "Event added to your calendar.");
       setEditorOpen(false);
       setEditScopeOpen(false);
       setEditingOccurrence(null);
       setAnchorDate(dateFromKey(form.date));
       notifyScheduleChanged();
+      await syncSavedEvent(savedLocalEvent);
       return;
     }
 
     const supabase = createClient();
+    let savedEventForGoogle: ScheduleEvent | null = null;
 
     if (editingOccurrence && scope === "occurrence") {
       const { data, error: exceptionError } = await supabase.from("schedule_event_exceptions").upsert({
@@ -428,6 +450,26 @@ export default function CalendarPage() {
       }
       setExceptions((current) => [...current.filter((item) => !(item.eventId === editingOccurrence.id && item.originalStartsAt === editingOccurrence.originalStartsAt)), exceptionFromRow(data)]);
       setNotice("This occurrence was updated.");
+      const baseEvent = events.find((event) => event.id === editingOccurrence.id);
+      if (baseEvent) {
+        try {
+          const syncResult = await syncGoogleCalendarOccurrence(baseEvent, editingOccurrence.originalStartsAt, {
+            startsAt: payload.starts_at,
+            endsAt: payload.ends_at,
+            title: payload.title,
+            detail: payload.detail,
+            kind: payload.kind,
+            tone: payload.tone,
+            travelMinutes: payload.travel_minutes,
+            hourlyRate: payload.hourly_rate,
+            fixedFee: payload.fixed_fee,
+            status: payload.status,
+          });
+          if (syncResult === "synced") setNotice("This occurrence was updated. Google Calendar updated.");
+        } catch (syncError) {
+          setError(`The occurrence was updated, but Google Calendar sync failed: ${syncError instanceof Error ? syncError.message : "unknown error"}`);
+        }
+      }
     } else if (editingOccurrence) {
       if (scope === "all" && editingOccurrence.exceptionId) {
         const { error: exceptionDeleteError } = await supabase.from("schedule_event_exceptions").delete().eq("id", editingOccurrence.exceptionId);
@@ -456,8 +498,9 @@ export default function CalendarPage() {
         setError(error.message || updateError?.message || "The event could not be updated.");
         return;
       }
-      setEvents((current) => current.map((item) => item.id === editingOccurrence.id ? eventFromRow({
-        ...item,
+      const updatedEvent = eventFromRow({
+        id: editingOccurrence.id,
+        user_id: userId,
         starts_at: payload.starts_at,
         ends_at: payload.ends_at,
         timezone: payload.timezone,
@@ -465,16 +508,21 @@ export default function CalendarPage() {
         detail: payload.detail,
         kind: payload.kind,
         tone: payload.tone,
+        intensity: editingOccurrence.intensity,
+        prep_minutes: editingOccurrence.prepMinutes,
         travel_minutes: payload.travel_minutes,
         hourly_rate: payload.hourly_rate,
+        fixed_fee: editingOccurrence.fixedFee,
         status: payload.status,
         recurrence_weekdays: payload.recurrence_weekdays,
-          recurrence_until: payload.recurrence_until,
-          student_id: payload.student_id,
-      }, userId) : item));
+        recurrence_until: payload.recurrence_until,
+        student_id: payload.student_id,
+      }, userId);
+      setEvents((current) => current.map((item) => item.id === editingOccurrence.id ? updatedEvent : item));
+      savedEventForGoogle = updatedEvent;
       setNotice(scope === "all" ? "The recurring series was updated." : "Event updated.");
     } else {
-      const { error: saveError } = await supabase.from("schedule_events").insert(payload);
+      const { data: insertedRow, error: saveError } = await supabase.from("schedule_events").insert(payload).select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id").single();
       let fallbackRow: Record<string, unknown> | null = null;
       if (saveError) {
         if (form.recurring) {
@@ -503,7 +551,13 @@ export default function CalendarPage() {
         }
         fallbackRow = fallback.data;
       }
-      if (fallbackRow) setEvents((current) => [...current, eventFromRow(fallbackRow, userId)]);
+      if (fallbackRow) {
+        savedEventForGoogle = eventFromRow(fallbackRow, userId);
+        setEvents((current) => [...current, savedEventForGoogle as ScheduleEvent]);
+      } else if (insertedRow) {
+        savedEventForGoogle = eventFromRow(insertedRow, userId);
+        setEvents((current) => [...current, savedEventForGoogle as ScheduleEvent]);
+      }
       else {
         const { data } = await supabase.from("schedule_events").select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id").lt("starts_at", new Date(rangeEndMs).toISOString()).order("starts_at", { ascending: true });
         if (data) setEvents(data.map((row) => eventFromRow(row, userId)));
@@ -515,6 +569,7 @@ export default function CalendarPage() {
     setEditingOccurrence(null);
     setAnchorDate(dateFromKey(form.date));
     notifyScheduleChanged();
+    if (savedEventForGoogle) await syncSavedEvent(savedEventForGoogle);
   };
 
   const saveEvent = async (event: FormEvent<HTMLFormElement>) => {
@@ -599,6 +654,7 @@ export default function CalendarPage() {
       setSelectedOccurrence(null);
       setNotice("Event deleted.");
       notifyScheduleChanged();
+      await syncDeletedEvent(selectedOccurrence);
       return;
     }
     const supabase = createClient();
@@ -607,6 +663,7 @@ export default function CalendarPage() {
     let deleteError: Error | null = null;
     let deletedParent = false;
     let deletedLegacy = false;
+    let updatedFollowingEvent: ScheduleEvent | null = null;
 
     if (selectedOccurrence.isRecurring && scope === "occurrence") {
       const result = await supabase.from("schedule_event_exceptions").upsert({
@@ -625,6 +682,7 @@ export default function CalendarPage() {
       if (!deleteError) {
         setEvents((current) => current.map((event) => event.id === selectedOccurrence.id ? { ...event, recurrenceUntil: cutoff } : event));
         setExceptions((current) => current.filter((exception) => exception.eventId !== selectedOccurrence.id || dateKey(new Date(exception.originalStartsAt)) < dateKey(new Date(selectedOccurrence.originalStartsAt))));
+        if (baseEvent) updatedFollowingEvent = { ...baseEvent, recurrenceUntil: cutoff };
       }
     } else {
       const canonicalResult = await supabase.from("schedule_events").delete().eq("id", selectedOccurrence.id).select("id");
@@ -650,6 +708,26 @@ export default function CalendarPage() {
     setSelectedOccurrence(null);
     setNotice(scope === "occurrence" ? "This occurrence was removed." : scope === "following" ? "This and future occurrences were removed." : "The recurring event was deleted.");
     notifyScheduleChanged();
+    if (scope === "following" && updatedFollowingEvent) await syncSavedEvent(updatedFollowingEvent);
+    else if (scope === "occurrence" && baseEvent) {
+      try {
+        const syncResult = await syncGoogleCalendarOccurrence(baseEvent, selectedOccurrence.originalStartsAt, {
+          startsAt: null,
+          endsAt: null,
+          title: null,
+          detail: null,
+          kind: null,
+          tone: null,
+          travelMinutes: null,
+          hourlyRate: null,
+          fixedFee: null,
+          status: "cancelled",
+        });
+        if (syncResult === "synced") setNotice("This occurrence was removed. Google Calendar updated.");
+      } catch (syncError) {
+        setError(`The occurrence was removed, but Google Calendar sync failed: ${syncError instanceof Error ? syncError.message : "unknown error"}`);
+      }
+    } else if (scope !== "occurrence") await syncDeletedEvent(baseEvent ?? selectedOccurrence);
   };
 
   return (

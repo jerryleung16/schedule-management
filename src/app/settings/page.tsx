@@ -1,9 +1,10 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { ArrowLeft, Check, Clock3, Save, Sparkles, UserRound } from "lucide-react";
+import { ArrowLeft, CalendarDays, Check, Clock3, Link2, Save, Sparkles, Unlink2, UserRound } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
+import { connectGoogleCalendar, disconnectGoogleCalendar, googleCalendarConfigured, googleCalendarIsConnected } from "@/lib/google-calendar/client";
 import type { EventTone, SchedulePreferences } from "@/lib/schedule/types";
 
 const storageKey = "daylight-settings";
@@ -40,6 +41,8 @@ export default function SettingsPage() {
   const [form, setForm] = useState<SchedulePreferences>(defaultPreferences);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [googleConnected, setGoogleConnected] = useState(false);
+  const [googleBusy, setGoogleBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -55,6 +58,7 @@ export default function SettingsPage() {
         } else {
           setForm({ ...defaultPreferences, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone });
         }
+        setGoogleConnected(googleCalendarIsConnected("local"));
         if (!cancelled) setLoading(false);
         return;
       }
@@ -66,6 +70,7 @@ export default function SettingsPage() {
         return;
       }
       setUserId(authData.user.id);
+      setGoogleConnected(googleCalendarIsConnected(authData.user.id));
       const { data, error: profileError } = await supabase.from("profiles").select("display_name, timezone, daily_stamina_limit, weekly_stamina_limit, default_lesson_rate, default_travel_minutes, default_lesson_tone, default_personal_tone").eq("id", authData.user.id).maybeSingle();
       if (profileError || !data) {
         const stored = window.localStorage.getItem(storageKey);
@@ -124,6 +129,29 @@ export default function SettingsPage() {
     setNotice(supabaseConfigured && userId !== "local" ? "Settings saved to the cloud." : "Settings saved in this browser.");
   };
 
+  const connectGoogle = async () => {
+    setGoogleBusy(true);
+    setError("");
+    try {
+      await connectGoogleCalendar(userId);
+      setGoogleConnected(true);
+      setNotice("Google Calendar connected. New schedule events will sync one way to your calendar.");
+    } catch (connectError) {
+      setError(connectError instanceof Error ? connectError.message : "Google Calendar could not be connected.");
+    } finally {
+      setGoogleBusy(false);
+    }
+  };
+
+  const disconnectGoogle = async () => {
+    setGoogleBusy(true);
+    setError("");
+    await disconnectGoogleCalendar();
+    setGoogleConnected(false);
+    setGoogleBusy(false);
+    setNotice("Google Calendar disconnected. Existing Google events were left untouched.");
+  };
+
   return (
     <main className="calendar-shell">
       <header className="calendar-topbar">
@@ -139,6 +167,7 @@ export default function SettingsPage() {
           <section className="panel settings-card"><div className="panel-heading"><div><p className="section-kicker">Profile</p><h2>Your details</h2></div><UserRound size={20} className="panel-icon" /></div><div className="settings-card-body"><label className="form-field"><span>Display name</span><input value={form.displayName} onChange={(event) => update("displayName", event.target.value)} /></label><label className="form-field"><span>Timezone</span><input value={form.timezone} onChange={(event) => update("timezone", event.target.value)} placeholder="e.g. Asia/Hong_Kong" /></label></div></section>
           <section className="panel settings-card"><div className="panel-heading"><div><p className="section-kicker">Energy</p><h2>Workload limits</h2></div><Clock3 size={20} className="panel-icon" /></div><div className="settings-card-body settings-two-column"><label className="form-field"><span>Daily stamina limit</span><input type="number" min="0" step="0.5" value={form.dailyStaminaLimit} onChange={(event) => update("dailyStaminaLimit", Number(event.target.value))} /></label><label className="form-field"><span>Weekly stamina limit</span><input type="number" min="0" step="0.5" value={form.weeklyStaminaLimit} onChange={(event) => update("weeklyStaminaLimit", Number(event.target.value))} /></label></div></section>
           <section className="panel settings-card settings-card-wide"><div className="panel-heading"><div><p className="section-kicker">New event defaults</p><h2>Start with less setup</h2></div><Sparkles size={20} className="panel-icon" /></div><div className="settings-card-body settings-two-column"><label className="form-field"><span>Default lesson rate</span><input type="number" min="0" step="0.5" value={form.defaultLessonRate} onChange={(event) => update("defaultLessonRate", Number(event.target.value))} /></label><label className="form-field"><span>Default travel minutes</span><input type="number" min="0" value={form.defaultTravelMinutes} onChange={(event) => update("defaultTravelMinutes", Number(event.target.value))} /></label><div className="tone-picker form-field"><span className="form-field-label">Lesson color</span><div>{tones.map((tone) => <button type="button" key={tone} aria-label={`Use ${tone} for lessons`} className={`tone-swatch tone-${tone} ${form.defaultLessonTone === tone ? "tone-selected" : ""}`} onClick={() => update("defaultLessonTone", tone)} />)}</div></div><div className="tone-picker form-field"><span className="form-field-label">Personal color</span><div>{tones.map((tone) => <button type="button" key={tone} aria-label={`Use ${tone} for personal events`} className={`tone-swatch tone-${tone} ${form.defaultPersonalTone === tone ? "tone-selected" : ""}`} onClick={() => update("defaultPersonalTone", tone)} />)}</div></div></div></section>
+          <section className="panel settings-card settings-card-wide"><div className="panel-heading"><div><p className="section-kicker">Calendar connection</p><h2>Send events to Google Calendar</h2></div><CalendarDays size={20} className="panel-icon" /></div><div className="settings-card-body google-calendar-settings"><div><p className="google-calendar-status"><span className={googleConnected ? "google-status-dot google-status-connected" : "google-status-dot"} /> {googleConnected ? "Connected" : "Not connected"}</p><p className="settings-help">Daylight can create, update, and remove events in your primary Google Calendar. Changes made in Google Calendar never come back into Daylight.</p>{!googleCalendarConfigured() && <p className="settings-help">Add <code>NEXT_PUBLIC_GOOGLE_CLIENT_ID</code> to your environment and configure this site as an authorized JavaScript origin in Google Cloud.</p>}</div><div className="google-calendar-actions">{googleConnected ? <button type="button" className="secondary-button" disabled={googleBusy} onClick={() => void disconnectGoogle()}><Unlink2 size={15} /> {googleBusy ? "Disconnecting..." : "Disconnect Google Calendar"}</button> : <button type="button" className="primary-button" disabled={googleBusy || !googleCalendarConfigured()} onClick={() => void connectGoogle()}><Link2 size={15} /> {googleBusy ? "Connecting..." : "Connect Google Calendar"}</button>}</div></div></section>
           <div className="settings-actions"><span /><button type="submit" className="primary-button" disabled={saving}><Save size={15} /> {saving ? "Saving..." : "Save settings"}</button></div>
         </form>}
       </div>
