@@ -245,7 +245,7 @@ export function googleCalendarIsConnected(userId: string) {
 
 export async function connectGoogleCalendar(userId: string) {
   if (!googleClientId()) throw new Error("Add NEXT_PUBLIC_GOOGLE_CLIENT_ID to enable Google Calendar sync.");
-  await requestAccessToken("consent");
+  await requestAccessToken();
   await googleFetch("/calendars/primary/events?maxResults=1&showDeleted=false");
   setConnection(userId);
 }

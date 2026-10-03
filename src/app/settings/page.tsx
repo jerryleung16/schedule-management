@@ -4,8 +4,8 @@ import { FormEvent, useEffect, useState } from "react";
 import { ArrowLeft, CalendarDays, Check, Clock3, Link2, Save, Sparkles, Unlink2, UserRound } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
-import { connectGoogleCalendar, disconnectGoogleCalendar, googleCalendarConfigured, googleCalendarIsConnected, prepareGoogleCalendar } from "@/lib/google-calendar/client";
-import type { EventTone, SchedulePreferences } from "@/lib/schedule/types";
+import { connectGoogleCalendar, disconnectGoogleCalendar, googleCalendarConfigured, googleCalendarIsConnected, prepareGoogleCalendar, syncGoogleCalendarEvent } from "@/lib/google-calendar/client";
+import type { EventStatus, EventTone, ScheduleEvent, SchedulePreferences } from "@/lib/schedule/types";
 
 const storageKey = "daylight-settings";
 const supabaseConfigured = Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY);
@@ -32,6 +32,29 @@ function preferencesFromRow(row: Record<string, unknown>): SchedulePreferences {
     defaultTravelMinutes: Number(row.default_travel_minutes ?? defaultPreferences.defaultTravelMinutes),
     defaultLessonTone: tones.includes(row.default_lesson_tone as EventTone) ? row.default_lesson_tone as EventTone : defaultPreferences.defaultLessonTone,
     defaultPersonalTone: tones.includes(row.default_personal_tone as EventTone) ? row.default_personal_tone as EventTone : defaultPreferences.defaultPersonalTone,
+  };
+}
+
+function scheduleEventFromRow(row: Record<string, unknown>, userId: string): ScheduleEvent {
+  return {
+    id: String(row.id),
+    userId,
+    startsAt: String(row.starts_at),
+    endsAt: String(row.ends_at),
+    timezone: String(row.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone),
+    title: String(row.title),
+    detail: String(row.detail ?? ""),
+    kind: row.kind === "personal" ? "personal" : "lesson",
+    tone: (row.tone as EventTone) ?? "coral",
+    intensity: Number(row.intensity ?? 2),
+    prepMinutes: Number(row.prep_minutes ?? 0),
+    travelMinutes: Number(row.travel_minutes ?? 0),
+    hourlyRate: Number(row.hourly_rate ?? 0),
+    fixedFee: row.fixed_fee === null || row.fixed_fee === undefined ? null : Number(row.fixed_fee),
+    status: (row.status as EventStatus) ?? "scheduled",
+    recurrenceWeekdays: Array.isArray(row.recurrence_weekdays) ? row.recurrence_weekdays.map(Number) : [],
+    recurrenceUntil: row.recurrence_until ? String(row.recurrence_until) : null,
+    studentId: row.student_id ? String(row.student_id) : null,
   };
 }
 
@@ -138,8 +161,20 @@ export default function SettingsPage() {
     setError("");
     try {
       await connectGoogleCalendar(userId);
+      let syncedExistingEvents = 0;
+      if (supabaseConfigured && userId !== "local") {
+        const { data: existingEvents, error: eventsError } = await createClient()
+          .from("schedule_events")
+          .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id")
+          .eq("user_id", userId);
+        if (eventsError) throw new Error(`Google Calendar connected, but existing events could not be loaded: ${eventsError.message}`);
+        for (const row of existingEvents ?? []) {
+          await syncGoogleCalendarEvent(scheduleEventFromRow(row, userId));
+          syncedExistingEvents += 1;
+        }
+      }
       setGoogleConnected(true);
-      setNotice("Google Calendar connected. New schedule events will sync one way to your calendar.");
+      setNotice(`Google Calendar connected. ${syncedExistingEvents} existing event${syncedExistingEvents === 1 ? "" : "s"} synced; new schedule events will sync one way to your calendar.`);
     } catch (connectError) {
       setError(connectError instanceof Error ? connectError.message : "Google Calendar could not be connected.");
     } finally {
