@@ -4,7 +4,7 @@ const isGitHubPages = process.env.GITHUB_ACTIONS === "true";
 const localHeaders: Pick<NextConfig, "headers"> = isGitHubPages ? {} : {
   headers: async () => [{
     source: "/(.*)",
-    headers: [{ key: "Cross-Origin-Opener-Policy", value: "same-origin-allow-popups" }],
+    headers: [{ key: "Cross-Origin-Opener-Policy", value: "unsafe-none" }],
   }],
 };
 
