@@ -168,7 +168,19 @@ export default function SettingsPage() {
           .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id")
           .eq("user_id", userId);
         if (eventsError) throw new Error(`Google Calendar connected, but existing events could not be loaded: ${eventsError.message}`);
-        for (const row of existingEvents ?? []) {
+        const canonicalIds = new Set((existingEvents ?? []).map((row) => String(row.id)));
+        const { data: legacyEvents, error: legacyError } = await createClient()
+          .from("lessons")
+          .select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id")
+          .eq("user_id", userId);
+        if (legacyError) throw new Error(`Google Calendar connected, but legacy events could not be loaded: ${legacyError.message}`);
+        const allEvents = [
+          ...(existingEvents ?? []),
+          ...(legacyEvents ?? [])
+            .filter((row) => !canonicalIds.has(String(row.id)))
+            .map((row) => ({ ...row, fixed_fee: null, recurrence_weekdays: [], recurrence_until: null })),
+        ];
+        for (const row of allEvents) {
           await syncGoogleCalendarEvent(scheduleEventFromRow(row, userId));
           syncedExistingEvents += 1;
         }
