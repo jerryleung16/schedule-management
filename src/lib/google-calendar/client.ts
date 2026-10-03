@@ -97,6 +97,11 @@ async function loadGoogleIdentityServices() {
   await scriptPromise;
 }
 
+export function prepareGoogleCalendar() {
+  if (!googleClientId()) return Promise.resolve();
+  return loadGoogleIdentityServices();
+}
+
 async function requestAccessToken(prompt = "") {
   const stored = loadStoredToken();
   if (stored) return stored.accessToken;

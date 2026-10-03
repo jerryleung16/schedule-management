@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { ArrowLeft, CalendarDays, Check, Clock3, Link2, Save, Sparkles, Unlink2, UserRound } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
-import { connectGoogleCalendar, disconnectGoogleCalendar, googleCalendarConfigured, googleCalendarIsConnected } from "@/lib/google-calendar/client";
+import { connectGoogleCalendar, disconnectGoogleCalendar, googleCalendarConfigured, googleCalendarIsConnected, prepareGoogleCalendar } from "@/lib/google-calendar/client";
 import type { EventTone, SchedulePreferences } from "@/lib/schedule/types";
 
 const storageKey = "daylight-settings";
@@ -45,6 +45,10 @@ export default function SettingsPage() {
   const [googleBusy, setGoogleBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    void prepareGoogleCalendar().catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
