@@ -106,7 +106,7 @@ async function requestAccessToken(prompt = "") {
   const stored = loadStoredToken();
   if (stored) return stored.accessToken;
   if (!googleClientId()) throw new Error("Add NEXT_PUBLIC_GOOGLE_CLIENT_ID to enable Google Calendar sync.");
-  await loadGoogleIdentityServices();
+  if (!window.google?.accounts?.oauth2) await loadGoogleIdentityServices();
   return new Promise<string>((resolve, reject) => {
     const tokenClient = window.google?.accounts.oauth2.initTokenClient({
       client_id: googleClientId(),
