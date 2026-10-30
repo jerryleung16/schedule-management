@@ -3,7 +3,7 @@
 import { FormEvent, useState } from "react";
 import { ArrowRight, LockKeyhole, Sparkles } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { createClient } from "@/lib/supabase/client";
+import { database } from "@/lib/data/client";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -16,9 +16,7 @@ export default function LoginPage() {
     event.preventDefault();
     setError("");
     setIsSubmitting(true);
-
-    const supabase = createClient();
-    const { error: loginError } = await supabase.auth.signInWithPassword({ email, password });
+    const { error: loginError } = await database.auth.signInWithPassword({ email, password });
 
     if (loginError) {
       setError(loginError.message);
@@ -48,7 +46,7 @@ export default function LoginPage() {
             {error && <p className="auth-error" role="alert">{error}</p>}
             <button className="auth-submit" type="submit" disabled={isSubmitting}>{isSubmitting ? "Signing in..." : "Sign in"}<ArrowRight size={17} /></button>
           </form>
-          <p className="auth-note">Your schedule is private and protected by Supabase.</p>
+          <p className="auth-note">Your schedule is private and protected by Firebase.</p>
         </div>
       </section>
     </main>

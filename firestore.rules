@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function approved(uid) {
+      return request.auth != null && request.auth.uid == uid
+        && get(/databases/$(database)/documents/access/$(uid)).data.enabled == true;
+    }
+    function text(value, maximum) { return value is string && value.size() <= maximum; }
+    function instant(value) { return value is string && value.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z'); }
+    function day(value) { return value is string && value.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}'); }
+    function amount(value) { return value is number && value >= 0 && value < 1000000000000000; }
+    function minutes(value) { return value is int && amount(value); }
+    function tone(value) { return value in ['blue', 'coral', 'teal', 'yellow', 'violet']; }
+    function kind(value) { return value in ['lesson', 'personal']; }
+    function status(value) { return value in ['scheduled', 'completed', 'cancelled', 'skipped']; }
+    function weekday(value) { return value is int && value >= 0 && value <= 6; }
+    function base(data, uid, id) { return data.id == id && data.user_id == uid && instant(data.created_at) && instant(data.updated_at); }
+    function interval(data) {
+      let starts = data.starts;
+      let ends = data.ends;
+      return data.weekday in [0, 1, 2, 3, 4, 5, 6]
+        && starts.matches('([01][0-9]|2[0-3]):[0-5][0-9]')
+        && ends.matches('([01][0-9]|2[0-3]):[0-5][0-9]') && ends > starts;
+    }
+    function profile(data, uid) {
+      return base(data, uid, uid) && data.keys().hasAll(["id","user_id","created_at","updated_at","display_name","timezone","daily_stamina_limit","weekly_stamina_limit","default_lesson_rate","default_travel_minutes","default_lesson_tone","default_personal_tone"]) && data.keys().hasOnly(["id","user_id","created_at","updated_at","display_name","timezone","daily_stamina_limit","weekly_stamina_limit","default_lesson_rate","default_travel_minutes","default_lesson_tone","default_personal_tone"])
+        && text(data.display_name, 200) && text(data.timezone, 100) && data.timezone.size() > 0
+        && amount(data.daily_stamina_limit) && amount(data.weekly_stamina_limit) && amount(data.default_lesson_rate)
+        && minutes(data.default_travel_minutes) && tone(data.default_lesson_tone) && tone(data.default_personal_tone);
+    }
+    function student(data, uid, id) {
+      return base(data, uid, id) && data.keys().hasAll(["id","user_id","created_at","updated_at","name","email","phone","notes","status"]) && data.keys().hasOnly(["id","user_id","created_at","updated_at","name","email","phone","notes","status"])
+        && text(data.name, 200) && data.name.size() > 0 && text(data.email, 320)
+        && text(data.phone, 100) && text(data.notes, 10000) && data.status in ['active', 'archived'];
+    }
+    function event(data, uid, id) {
+      return base(data, uid, id) && data.keys().hasAll(["id","user_id","created_at","updated_at","starts_at","ends_at","timezone","title","detail","kind","tone","intensity","prep_minutes","travel_minutes","hourly_rate","fixed_fee","status","recurrence_weekdays","recurrence_until","student_id","range_end"]) && data.keys().hasOnly(["id","user_id","created_at","updated_at","starts_at","ends_at","timezone","title","detail","kind","tone","intensity","prep_minutes","travel_minutes","hourly_rate","fixed_fee","status","recurrence_weekdays","recurrence_until","student_id","range_end"])
+        && instant(data.starts_at) && instant(data.ends_at) && data.ends_at > data.starts_at
+        && text(data.timezone, 100) && data.timezone.size() > 0 && text(data.title, 500) && data.title.size() > 0
+        && text(data.detail, 10000) && kind(data.kind) && tone(data.tone) && status(data.status)
+        && amount(data.intensity) && minutes(data.prep_minutes) && minutes(data.travel_minutes)
+        && amount(data.hourly_rate) && (data.fixed_fee == null || amount(data.fixed_fee))
+        && data.recurrence_weekdays is list && data.recurrence_weekdays.size() <= 7 && data.recurrence_weekdays.hasOnly([0, 1, 2, 3, 4, 5, 6])
+        && (data.recurrence_until == null || day(data.recurrence_until))
+        && instant(data.range_end) && data.range_end >= data.ends_at
+        && (data.recurrence_weekdays.size() > 0 || data.range_end == data.ends_at)
+        && (data.student_id == null || (text(data.student_id, 200) && exists(/databases/$(database)/documents/users/$(uid)/students/$(data.student_id))));
+    }
+    function exception(data, uid, id) {
+      return base(data, uid, id) && data.keys().hasAll(["id","user_id","created_at","updated_at","event_id","original_starts_at","starts_at","ends_at","status","title","detail","kind","tone","travel_minutes","hourly_rate","fixed_fee"]) && data.keys().hasOnly(["id","user_id","created_at","updated_at","event_id","original_starts_at","starts_at","ends_at","status","title","detail","kind","tone","travel_minutes","hourly_rate","fixed_fee"])
+        && text(data.event_id, 200) && instant(data.original_starts_at)
+        && id == data.event_id + '__' + data.original_starts_at
+        && getAfter(/databases/$(database)/documents/users/$(uid)/events/$(data.event_id)).data.user_id == uid
+        && ((data.starts_at == null && data.ends_at == null) || (instant(data.starts_at) && instant(data.ends_at) && data.ends_at > data.starts_at))
+        && status(data.status) && (data.title == null || text(data.title, 500)) && (data.detail == null || text(data.detail, 10000))
+        && (data.kind == null || kind(data.kind)) && (data.tone == null || tone(data.tone))
+        && (data.travel_minutes == null || minutes(data.travel_minutes)) && (data.hourly_rate == null || amount(data.hourly_rate)) && (data.fixed_fee == null || amount(data.fixed_fee));
+    }
+    match /access/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+      allow list, write: if false;
+    }
+    match /users/{uid} {
+      allow read: if approved(uid);
+      allow create, update: if approved(uid) && profile(request.resource.data, uid);
+      allow delete: if false;
+      match /students/{id} {
+        allow read: if approved(uid);
+        allow create, update: if approved(uid) && student(request.resource.data, uid, id);
+        allow delete: if false;
+      }
+      match /events/{id} {
+        allow read, delete: if approved(uid);
+        allow create, update: if approved(uid) && event(request.resource.data, uid, id);
+      }
+      match /eventExceptions/{id} {
+        allow read, delete: if approved(uid);
+        allow create, update: if approved(uid) && exception(request.resource.data, uid, id);
+      }
+      match /weeklyAvailability/{id} {
+        allow read, delete: if approved(uid);
+        allow create, update: if approved(uid) && base(request.resource.data, uid, id)
+          && request.resource.data.keys().hasAll(["id","user_id","created_at","updated_at","weekday","starts","ends"]) && request.resource.data.keys().hasOnly(["id","user_id","created_at","updated_at","weekday","starts","ends"])
+          && interval(request.resource.data);
+      }
+      match /availabilityOverrides/{id} {
+        allow read, delete: if approved(uid);
+        allow create, update: if approved(uid) && base(request.resource.data, uid, id)
+          && request.resource.data.keys().hasAll(["id","user_id","created_at","updated_at","week_start"]) && request.resource.data.keys().hasOnly(["id","user_id","created_at","updated_at","week_start"])
+          && day(request.resource.data.week_start) && id == request.resource.data.week_start;
+      }
+      match /overrideIntervals/{id} {
+        allow read, delete: if approved(uid);
+        allow create, update: if approved(uid) && base(request.resource.data, uid, id)
+          && request.resource.data.keys().hasAll(["id","user_id","created_at","updated_at","week_start","weekday","starts","ends"]) && request.resource.data.keys().hasOnly(["id","user_id","created_at","updated_at","week_start","weekday","starts","ends"])
+          && day(request.resource.data.week_start) && interval(request.resource.data)
+          && getAfter(/databases/$(database)/documents/users/$(uid)/availabilityOverrides/$(request.resource.data.week_start)).data.week_start == request.resource.data.week_start;
+      }
+      match /workingPlaces/{id} {
+        allow read, delete: if approved(uid);
+        allow create, update: if approved(uid) && base(request.resource.data, uid, id)
+          && request.resource.data.keys().hasAll(["id","user_id","created_at","updated_at","weekday","place"]) && request.resource.data.keys().hasOnly(["id","user_id","created_at","updated_at","weekday","place"])
+          && weekday(request.resource.data.weekday) && id == string(request.resource.data.weekday)
+          && text(request.resource.data.place, 120) && request.resource.data.place.size() > 0;
+      }
+    }
+  }
+}

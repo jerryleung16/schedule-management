@@ -1,0 +1,33 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "events",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "starts_at",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "range_end",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "eventExceptions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "starts_at",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "ends_at",
+          "order": "ASCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

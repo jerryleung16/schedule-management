@@ -3,12 +3,11 @@
 import { FormEvent, useEffect, useState } from "react";
 import { ArrowLeft, CalendarDays, Check, Clock3, Link2, Save, Sparkles, Unlink2, UserRound } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { createClient } from "@/lib/supabase/client";
+import { database, cloudConfigured } from "@/lib/data/client";
 import { connectGoogleCalendar, disconnectGoogleCalendar, googleCalendarConfigured, googleCalendarIsConnected, prepareGoogleCalendar, syncGoogleCalendarEvent } from "@/lib/google-calendar/client";
 import type { EventStatus, EventTone, ScheduleEvent, SchedulePreferences } from "@/lib/schedule/types";
 
 const storageKey = "daylight-settings";
-const supabaseConfigured = Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY);
 const tones: EventTone[] = ["blue", "coral", "teal", "yellow", "violet"];
 
 const defaultPreferences: SchedulePreferences = {
@@ -78,7 +77,7 @@ export default function SettingsPage() {
     const load = async () => {
       setLoading(true);
       setError("");
-      if (!supabaseConfigured) {
+      if (!cloudConfigured) {
         const stored = window.localStorage.getItem(storageKey);
         if (stored) {
           try { setForm({ ...defaultPreferences, ...(JSON.parse(stored) as Partial<SchedulePreferences>) }); } catch { window.localStorage.removeItem(storageKey); }
@@ -89,8 +88,7 @@ export default function SettingsPage() {
         if (!cancelled) setLoading(false);
         return;
       }
-      const supabase = createClient();
-      const { data: authData, error: authError } = await supabase.auth.getUser();
+      const { data: authData, error: authError } = await database.auth.getUser();
       if (cancelled) return;
       if (authError || !authData.user) {
         router.push("/login");
@@ -98,13 +96,13 @@ export default function SettingsPage() {
       }
       setUserId(authData.user.id);
       setGoogleConnected(googleCalendarIsConnected(authData.user.id));
-      const { data, error: profileError } = await supabase.from("profiles").select("display_name, timezone, daily_stamina_limit, weekly_stamina_limit, default_lesson_rate, default_travel_minutes, default_lesson_tone, default_personal_tone").eq("id", authData.user.id).maybeSingle();
+      const { data, error: profileError } = await database.getProfile();
       if (profileError || !data) {
         const stored = window.localStorage.getItem(storageKey);
         if (stored) {
           try { setForm({ ...defaultPreferences, ...(JSON.parse(stored) as Partial<SchedulePreferences>) }); } catch { window.localStorage.removeItem(storageKey); }
         }
-        setError("Cloud preferences are not ready yet; local settings are being used. Apply migration 005 to enable sync.");
+        setError("Cloud preferences could not be loaded. Check your connection and Firebase access rules before saving.");
       } else {
         setForm(preferencesFromRow(data));
       }
@@ -115,7 +113,7 @@ export default function SettingsPage() {
   }, [router]);
 
   useEffect(() => {
-    if (!supabaseConfigured) window.localStorage.setItem(storageKey, JSON.stringify(form));
+    if (!cloudConfigured) window.localStorage.setItem(storageKey, JSON.stringify(form));
   }, [form]);
 
   const update = <K extends keyof SchedulePreferences>(key: K, value: SchedulePreferences[K]) => setForm((current) => ({ ...current, [key]: value }));
@@ -133,8 +131,8 @@ export default function SettingsPage() {
     setSaving(true);
     setError("");
     const nextForm = { ...form, displayName: form.displayName.trim() };
-    if (supabaseConfigured && userId !== "local") {
-      const result = await createClient().from("profiles").upsert({
+    if (cloudConfigured && userId !== "local") {
+      const result = await database.saveProfile({
         id: userId,
         display_name: nextForm.displayName,
         timezone: nextForm.timezone,
@@ -153,7 +151,7 @@ export default function SettingsPage() {
     }
     setForm(nextForm);
     setSaving(false);
-    setNotice(supabaseConfigured && userId !== "local" ? "Settings saved to the cloud." : "Settings saved in this browser.");
+    setNotice(cloudConfigured && userId !== "local" ? "Settings saved to the cloud." : "Settings saved in this browser.");
   };
 
   const connectGoogle = async () => {
@@ -162,25 +160,10 @@ export default function SettingsPage() {
     try {
       await connectGoogleCalendar(userId);
       let syncedExistingEvents = 0;
-      if (supabaseConfigured && userId !== "local") {
-        const { data: existingEvents, error: eventsError } = await createClient()
-          .from("schedule_events")
-          .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id")
-          .eq("user_id", userId);
+      if (cloudConfigured && userId !== "local") {
+        const { data: existingEvents, error: eventsError } = await database.listEvents();
         if (eventsError) throw new Error(`Google Calendar connected, but existing events could not be loaded: ${eventsError.message}`);
-        const canonicalIds = new Set((existingEvents ?? []).map((row) => String(row.id)));
-        const { data: legacyEvents, error: legacyError } = await createClient()
-          .from("lessons")
-          .select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id")
-          .eq("user_id", userId);
-        if (legacyError) throw new Error(`Google Calendar connected, but legacy events could not be loaded: ${legacyError.message}`);
-        const allEvents = [
-          ...(existingEvents ?? []),
-          ...(legacyEvents ?? [])
-            .filter((row) => !canonicalIds.has(String(row.id)))
-            .map((row) => ({ ...row, fixed_fee: null, recurrence_weekdays: [], recurrence_until: null })),
-        ];
-        for (const row of allEvents) {
+        for (const row of existingEvents ?? []) {
           await syncGoogleCalendarEvent(scheduleEventFromRow(row, userId));
           syncedExistingEvents += 1;
         }

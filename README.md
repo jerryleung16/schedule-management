@@ -19,7 +19,7 @@ The first implementation is a responsive dashboard prototype with:
 - Optional one-way Google Calendar event synchronization from the calendar workspace.
 - A mobile navigation layout and desktop sidebar.
 
-Without Supabase variables, the app runs in local demo mode. With Supabase configured, login is required and lesson add/edit/delete operations are stored in the authenticated user's database rows.
+Firebase Authentication and Cloud Firestore provide private cross-device storage. Cloud mode is the default and requires configuration plus an approved account. For an explicit browser-only demo, set `NEXT_PUBLIC_DATA_MODE=local`. Missing cloud configuration never silently switches you to local storage.
 
 ## Run locally
 ```bash
@@ -29,25 +29,14 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
-## Enable Supabase
+## Enable Firebase
 
-1. Create a project at [supabase.com](https://supabase.com).
-2. In the Supabase Authentication dashboard, create your private user with email/password.
-3. Copy `.env.example` to `.env.local` and fill in the project URL and publishable key from the Supabase Connect dialog.
-4. Run `supabase/migrations/001_create_profiles_and_lessons.sql` in the Supabase SQL Editor.
-5. Run `supabase/migrations/002_schedule_events_and_exceptions.sql` after the initial migration. It creates the range-aware event store, recurrence fields, exception table, indexes, RLS policies, and migrates existing lessons.
-6. Restart the development server. The dashboard will redirect signed-out visitors to `/login`.
+1. Create a Firebase project, register a web app, enable Email/Password authentication, and create a Firestore database.
+2. Copy [the environment example](.env.example) into your local environment and fill in the four Firebase web configuration values.
+3. Follow the [migration and setup runbook](docs/firebase-migration.md) to deploy security rules/indexes, export Supabase data, rehearse, import, verify, and activate your private account.
+4. Add the public Firebase configuration to GitHub Actions repository variables before deploying. Do not upload admin credentials.
 
-The first migration creates `profiles` and `lessons`, a profile trigger for new users, ownership indexes, and explicit Row Level Security policies. The second migration adds `schedule_events` and `schedule_event_exceptions` for one-time and weekly events. Existing lessons are copied into the new event table; keep the original table during the transition. Do not put a Supabase secret/service-role key in `.env.local`, browser code, GitHub, or Vercel client variables.
-
-For Vercel, add these same two variables under Project Settings > Environment Variables:
-
-```env
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
-```
-
-Then add your local and production URLs under Supabase Authentication > URL Configuration.
+Application access is restricted by Firestore rules and the admin-only `access/{uid}` allowlist. Firebase configuration alone does not grant data access.
 
 ## Enable Google Calendar sync
 
@@ -82,18 +71,20 @@ In the repository settings, set **Pages > Build and deployment > Source** to **G
 For cloud persistence and authentication, add these repository variables under **Settings > Secrets and variables > Actions > Variables**:
 
 ```env
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
+NEXT_PUBLIC_FIREBASE_API_KEY=your-firebase-web-api-key
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=your-project.firebaseapp.com
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=your-project
+NEXT_PUBLIC_FIREBASE_APP_ID=your-firebase-web-app-id
 NEXT_PUBLIC_GOOGLE_CLIENT_ID=your-web-application-client-id.apps.googleusercontent.com
 ```
 
-GitHub Pages is a static host, so the server-side Supabase proxy is not available there. The dashboard and calendar retain their client-side authentication checks and use the public Supabase publishable key. Add the Pages URL under Supabase Authentication > URL Configuration.
+GitHub Pages remains the static host. Firebase Authentication runs in the browser, and Firestore rules enforce access independently of the UI. Add your Pages hostname to Firebase Authentication authorized domains. The deployment workflow checks all required Firebase variables before building; rules and indexes must be deployed separately first.
 
 ## Planned product direction
 
 - Next.js and TypeScript for the web application.
-- Supabase Authentication and PostgreSQL for private cross-device data.
-- Vercel for deployment from GitHub.
+- Firebase Authentication and Cloud Firestore for private cross-device data.
+- GitHub Pages for static deployment from GitHub.
 - Configurable daily and weekly stamina budgets using weighted lesson load points.
 - Hourly and fixed lesson rates, with completed lessons contributing to actual earnings.
 - Recurring lessons with reschedule, skip, and cancellation exceptions.

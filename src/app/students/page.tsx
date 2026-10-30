@@ -3,13 +3,12 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { ArrowLeft, Archive, CalendarDays, Pencil, Plus, Search, Sparkles, X } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { createClient } from "@/lib/supabase/client";
+import { database, cloudConfigured } from "@/lib/data/client";
 import { addDays, dateKey } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
 import type { EventKind, EventStatus, EventTone, ScheduleEvent, ScheduleEventException, Student, StudentStatus } from "@/lib/schedule/types";
 
 const storageKey = "daylight-students";
-const supabaseConfigured = Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY);
 
 type StudentForm = Pick<Student, "name" | "email" | "phone" | "notes">;
 type SummaryOccurrence = { id: string; studentId: string | null; startsAt: string; status: EventStatus };
@@ -91,7 +90,7 @@ export default function StudentsPage() {
     const load = async () => {
       setLoading(true);
       setError("");
-      if (!supabaseConfigured) {
+      if (!cloudConfigured) {
         const stored = window.localStorage.getItem(storageKey);
         let localStudents: Student[] = [];
         if (stored) {
@@ -112,38 +111,31 @@ export default function StudentsPage() {
         if (!cancelled) setLoading(false);
         return;
       }
-      const supabase = createClient();
-      const { data: authData, error: authError } = await supabase.auth.getUser();
+      const { data: authData, error: authError } = await database.auth.getUser();
       if (cancelled) return;
       if (authError || !authData.user) {
         router.push("/login");
         return;
       }
       setUserId(authData.user.id);
-      const { data, error: studentError } = await supabase.from("students").select("id, user_id, name, email, phone, notes, status").order("name");
+      const { data, error: studentError } = await database.listStudents();
       if (studentError) {
-        const stored = window.localStorage.getItem(storageKey);
-        if (stored) {
-          try { setStudents(JSON.parse(stored) as Student[]); } catch { window.localStorage.removeItem(storageKey); }
-        }
-        setError("Students cloud storage is not ready yet; local student data is being used. Apply migration 005 to enable sync.");
+        setError(studentError.message);
       } else {
         const loadedStudents = (data ?? []).map((row) => studentFromRow(row, authData.user.id));
         setStudents(loadedStudents);
         const rangeStart = addDays(new Date(), -90);
         const rangeEnd = addDays(new Date(), 91);
         const range = { start: rangeStart, end: rangeEnd };
-        const { data: eventData, error: eventError } = await supabase.from("schedule_events").select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id").lt("starts_at", rangeEnd.toISOString());
+        const { data: eventData, error: eventError } = await database.listEvents(range);
+        if (eventError && !cancelled) setError(eventError.message);
         const eventRows = eventError ? [] : (eventData ?? []);
         const eventIds = eventRows.map((row) => String(row.id));
-        const exceptionResult = eventIds.length ? await supabase.from("schedule_event_exceptions").select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").in("event_id", eventIds) : { data: [], error: null };
+        const exceptionResult = eventIds.length ? await database.listExceptions(eventIds) : { data: [], error: null };
+        if (exceptionResult.error && !cancelled) setError(exceptionResult.error.message);
         const canonicalOccurrences = expandEvents(eventRows.map((row) => eventFromRow(row, authData.user.id)), (exceptionResult.data ?? []).map((row) => exceptionFromRow(row)), range)
           .map((occurrence) => ({ id: occurrence.id, studentId: occurrence.studentId, startsAt: occurrence.startsAt, status: occurrence.status }));
-        const legacy = await supabase.from("lessons").select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id").gte("starts_at", rangeStart.toISOString()).lt("starts_at", rangeEnd.toISOString());
-        const legacyOccurrences = (legacy.data ?? [])
-          .filter((row) => !eventIds.includes(String(row.id)))
-          .map((row) => ({ id: String(row.id), studentId: row.student_id ? String(row.student_id) : null, startsAt: String(row.starts_at), status: (row.status as EventStatus) ?? "scheduled" }));
-        setSummaries(summarizeOccurrences(loadedStudents, [...canonicalOccurrences, ...legacyOccurrences]));
+        setSummaries(summarizeOccurrences(loadedStudents, canonicalOccurrences));
       }
       if (!cancelled) setLoading(false);
     };
@@ -152,7 +144,7 @@ export default function StudentsPage() {
   }, [router]);
 
   useEffect(() => {
-    if (!supabaseConfigured) window.localStorage.setItem(storageKey, JSON.stringify(students));
+    if (!cloudConfigured) window.localStorage.setItem(storageKey, JSON.stringify(students));
   }, [students]);
 
   const filteredStudents = useMemo(() => students
@@ -184,8 +176,8 @@ export default function StudentsPage() {
     const id = editingStudent?.id ?? crypto.randomUUID();
     const status = editingStudent?.status ?? "active";
     const nextStudent: Student = { id, userId, ...form, name: form.name.trim(), email: form.email.trim(), phone: form.phone.trim(), notes: form.notes.trim(), status };
-    if (supabaseConfigured && userId !== "local") {
-      const result = await createClient().from("students").upsert({ id, user_id: userId, name: nextStudent.name, email: nextStudent.email, phone: nextStudent.phone, notes: nextStudent.notes, status, updated_at: new Date().toISOString() });
+    if (cloudConfigured && userId !== "local") {
+      const result = await database.saveStudent({ id, user_id: userId, name: nextStudent.name, email: nextStudent.email, phone: nextStudent.phone, notes: nextStudent.notes, status, updated_at: new Date().toISOString() });
       if (result.error) {
         setSaving(false);
         setError(result.error.message || "The student could not be saved.");
@@ -202,8 +194,8 @@ export default function StudentsPage() {
     const nextStatus: StudentStatus = student.status === "active" ? "archived" : "active";
     setSaving(true);
     setError("");
-    if (supabaseConfigured && userId !== "local") {
-      const result = await createClient().from("students").update({ status: nextStatus, updated_at: new Date().toISOString() }).eq("id", student.id);
+    if (cloudConfigured && userId !== "local") {
+      const result = await database.updateStudent(student.id, { status: nextStatus, updated_at: new Date().toISOString() });
       if (result.error) {
         setSaving(false);
         setError(result.error.message);

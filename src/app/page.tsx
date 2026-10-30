@@ -24,7 +24,7 @@ import {
   UsersRound,
   X,
 } from "lucide-react";
-import { createClient } from "@/lib/supabase/client";
+import { database, cloudConfigured } from "@/lib/data/client";
 import { deleteGoogleCalendarEvent, syncGoogleCalendarEvent } from "@/lib/google-calendar/client";
 import { availabilityConflicts, formatWeeklyAvailabilityMessage, lessonHours, normalizeWeeklyAvailability, occupiedAvailabilityByWeekday, parseWeeklyAvailabilityOverride, practicalFreeSlots, resolveWeeklyAvailability, slotConflicts, staminaState, validateWeeklyAvailability, weekStartKey, weeklyAvailabilityOverrideStorageKey, weeklyAvailabilityStorageKey } from "@/lib/schedule/availability";
 import { addDays, dateFromKey, dateKey, rangeForView } from "@/lib/schedule/dates";
@@ -55,10 +55,6 @@ const scheduleChangedEvent = "daylight-schedule-changed";
 const scheduleDate = new Date().toISOString().slice(0, 10);
 const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const eventTones: EventTone[] = ["blue", "coral", "teal", "yellow", "violet"];
-const supabaseConfigured = Boolean(
-  process.env.NEXT_PUBLIC_SUPABASE_URL &&
-  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
-);
 
 function notifyScheduleChanged() {
   window.localStorage.setItem("daylight-schedule-version", String(Date.now()));
@@ -182,26 +178,6 @@ function lessonFromRow(row: {
     rate: Number(row.hourly_rate),
     studentId: row.student_id ? String(row.student_id) : null,
     status: row.status,
-  };
-}
-
-function lessonToRow(lesson: Lesson, userId: string, date: string) {
-  return {
-    id: lesson.id,
-    user_id: userId,
-    starts_at: new Date(`${date}T${lesson.time}:00`).toISOString(),
-    ends_at: new Date(`${date}T${lesson.end}:00`).toISOString(),
-    title: lesson.title.trim(),
-    detail: lesson.detail.trim(),
-    kind: lesson.kind,
-    tone: lesson.tone,
-    intensity: lesson.intensity,
-    prep_minutes: lesson.prepMinutes,
-    travel_minutes: lesson.travelMinutes,
-    hourly_rate: lesson.rate,
-    student_id: lesson.studentId,
-    status: lesson.status,
-    updated_at: new Date().toISOString(),
   };
 }
 
@@ -362,7 +338,7 @@ export default function Home() {
   useEffect(() => {
     const loadLessons = async () => {
       setDataError("");
-      if (!supabaseConfigured) {
+      if (!cloudConfigured) {
         const savedLessons = window.localStorage.getItem(`${storageKey}-${selectedDate}`);
         const savedSettings = window.localStorage.getItem("daylight-settings");
                 const savedStudents = window.localStorage.getItem("daylight-students");
@@ -426,8 +402,7 @@ export default function Home() {
       }
 
       setLessons([]);
-      const supabase = createClient();
-      const { data: userData, error: userError } = await supabase.auth.getUser();
+      const { data: userData, error: userError } = await database.auth.getUser();
       if (userError || !userData.user) {
         setDataError(userError?.message ?? "Sign in to load your schedule.");
         return;
@@ -435,87 +410,58 @@ export default function Home() {
 
       setUserId(userData.user.id);
       setUserEmail(userData.user.email ?? "");
-      const { data: profileData } = await supabase.from("profiles").select("display_name, default_lesson_rate, default_travel_minutes, default_lesson_tone").eq("id", userData.user.id).maybeSingle();
+      const { data: profileData, error: profileError } = await database.getProfile();
+      if (profileError) setDataError(profileError.message);
       if (profileData?.display_name) setDisplayName(profileData.display_name);
       if (profileData?.default_lesson_rate !== null && profileData?.default_lesson_rate !== undefined) setDefaultLessonRate(Number(profileData.default_lesson_rate));
       if (profileData?.default_travel_minutes !== null && profileData?.default_travel_minutes !== undefined) setDefaultTravelMinutes(Number(profileData.default_travel_minutes));
       if (profileData?.default_lesson_tone) setDefaultLessonTone(profileData.default_lesson_tone as EventTone);
-      const { data: studentData, error: studentError } = await supabase.from("students").select("id, user_id, name, email, phone, notes, status").eq("status", "active").order("name");
-      if (studentError && /students|student_id|schema cache|column/i.test(studentError.message)) setDataError("Apply migration 005 to enable student-calendar sync.");
+      const { data: studentData, error: studentError } = await database.listStudents(true);
+      if (studentError) setDataError(studentError.message);
       if (studentData) setStudents(studentData.map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" : "active" })));
       const selectedMonth = new Date(`${selectedDate}T12:00:00`);
       const monthStart = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), 1, 0);
       const monthEnd = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() + 1, 1, 0);
       const monthRange = { start: monthStart, end: monthEnd };
-      const canonicalMonth = await supabase
-        .from("schedule_events")
-        .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id")
-        .lt("starts_at", monthEnd.toISOString());
-      const legacyMonth = await supabase
-        .from("lessons")
-        .select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id")
-        .gte("starts_at", monthStart.toISOString())
-        .lt("starts_at", monthEnd.toISOString());
-      if (!canonicalMonth.error || !legacyMonth.error) {
+      const canonicalMonth = await database.listEvents(monthRange);
+      if (!canonicalMonth.error) {
         const canonicalRows = canonicalMonth.data ?? [];
-        const canonicalIds = new Set(canonicalRows.map((row) => String(row.id)));
-        const monthRows = [...canonicalRows, ...(legacyMonth.data ?? []).filter((row) => !canonicalIds.has(String(row.id)))];
+        const monthRows = canonicalRows;
         const monthEvents = monthRows.map((row) => scheduleEventFromRow(row, userData.user.id));
         const monthIds = canonicalRows.map((row) => row.id);
         const monthExceptions = monthIds.length
-          ? await supabase.from("schedule_event_exceptions").select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").in("event_id", monthIds)
+          ? await database.listExceptions(monthIds)
           : { data: [], error: null };
+        if (monthExceptions.error) { setDataError(monthExceptions.error.message); return; }
         const monthOccurrences = expandEvents(monthEvents, (monthExceptions.data ?? []).map((row) => exceptionFromRow(row)), monthRange);
         const payableLessons = monthOccurrences.filter((occurrence) => occurrence.kind === "lesson" && occurrence.status !== "cancelled" && occurrence.status !== "skipped");
         setMonthlyCompletedCount(payableLessons.length);
         setMonthlyCompletedEarnings(payableLessons.reduce((total, occurrence) => total + ((new Date(occurrence.endsAt).getTime() - new Date(occurrence.startsAt).getTime()) / 3600000) * occurrence.hourlyRate, 0));
       } else {
+        setDataError(canonicalMonth.error.message);
         setMonthlyCompletedCount(0);
         setMonthlyCompletedEarnings(0);
       }
       const weekRange = rangeForView(dateFromKey(availabilityWeekDate), "week");
-      const weekStart = weekRange.start;
-      const weekEnd = weekRange.end;
-      const canonicalWeek = await supabase
-        .from("schedule_events")
-        .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id")
-        .lt("starts_at", weekEnd.toISOString())
-        .order("starts_at", { ascending: true });
-      let weekData = canonicalWeek.data as unknown as Record<string, unknown>[] | null;
-      let weekError = canonicalWeek.error;
-      if (weekError) {
-        const fallbackWeek = await supabase.from("lessons").select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id").gte("starts_at", weekStart.toISOString()).lt("starts_at", weekEnd.toISOString());
-        weekData = fallbackWeek.data as unknown as Record<string, unknown>[] | null;
-        weekError = fallbackWeek.error;
-      }
+      const canonicalWeek = await database.listEvents(weekRange);
+      const weekData = canonicalWeek.data;
+      const weekError = canonicalWeek.error;
+      if (weekError) setDataError(weekError.message);
+
       if (!weekError) {
         const scheduleEvents = (weekData ?? []).map((row) => scheduleEventFromRow(row, userData.user.id));
         const eventIds = (weekData ?? []).map((row) => row.id);
         let exceptions: ScheduleEventException[] = [];
         if (eventIds.length) {
-          const { data: exceptionData } = await supabase.from("schedule_event_exceptions").select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").in("event_id", eventIds);
+          const { data: exceptionData, error: exceptionError } = await database.listExceptions(eventIds);
+          if (exceptionError) { setDataError(exceptionError.message); return; }
           exceptions = (exceptionData ?? []).map((row) => exceptionFromRow(row));
         }
         const expanded = expandEvents(scheduleEvents, exceptions, weekRange);
         setWeeklyOccurrences(expanded);
         setWeeklyLessonHours(lessonHours(expanded));
       }
-      let { data, error } = await supabase
-        .from("schedule_events")
-        .select("id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id")
-        .gte("starts_at", new Date(`${selectedDate}T00:00:00`).toISOString())
-        .lt("starts_at", new Date(`${selectedDate}T23:59:59`).toISOString())
-        .order("starts_at", { ascending: true });
-      if (error) {
-        const fallback = await supabase
-          .from("lessons")
-          .select("id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id")
-          .gte("starts_at", new Date(`${selectedDate}T00:00:00`).toISOString())
-          .lt("starts_at", new Date(`${selectedDate}T23:59:59`).toISOString())
-          .order("starts_at", { ascending: true });
-        data = fallback.data;
-        error = fallback.error;
-      }
+      const { data, error } = await database.listDailyEvents(new Date(`${selectedDate}T00:00:00`).toISOString(), new Date(`${selectedDate}T23:59:59`).toISOString());
 
       if (error) {
         setDataError(error.message);
@@ -530,7 +476,7 @@ export default function Home() {
   }, [scheduleRefreshVersion, selectedDate, availabilityWeekDate]);
 
   useEffect(() => {
-    if (supabaseConfigured && !userId) return;
+    if (cloudConfigured && !userId) return;
     let cancelled = false;
     const loadAvailability = async () => {
       let loadedDefault: WeeklyAvailability[] = [];
@@ -571,13 +517,12 @@ export default function Home() {
           window.localStorage.removeItem(workingPlaceStorageKey);
         }
       };
-      if (!supabaseConfigured) {
+      if (!cloudConfigured) {
         loadLocalDefault();
         loadLocalOverrides();
         loadLocalWorkingPlaces();
       } else {
-        const supabase = createClient();
-        const { data, error } = await supabase.from("weekly_availability").select("id, weekday, starts, ends").eq("user_id", userId).order("weekday").order("starts");
+        const { data, error } = await database.listAvailability();
         if (error) {
           loadLocalDefault();
           if (!cancelled) setAvailabilityError("Cloud availability is not ready yet; local availability is being used.");
@@ -585,12 +530,7 @@ export default function Home() {
           loadedDefault = (data ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), starts: String(row.starts).slice(0, 5), ends: String(row.ends).slice(0, 5) }));
         }
         const monthRange = rangeForView(dateFromKey(availabilityWeekDate), "month");
-        const { data: overrideData, error: overrideError } = await supabase
-          .from("weekly_availability_overrides")
-          .select("id, week_start, intervals")
-          .eq("user_id", userId)
-          .gte("week_start", dateKey(monthRange.start))
-          .lt("week_start", dateKey(monthRange.end));
+        const { data: overrideData, error: overrideError } = await database.listAvailabilityOverrides(dateKey(monthRange.start), dateKey(monthRange.end));
         if (overrideError) {
           loadLocalOverrides();
           if (!cancelled) setAvailabilityError("Week-specific availability is not ready yet; local week values are being used.");
@@ -600,7 +540,7 @@ export default function Home() {
             return parsed ? [[parsed.weekStart, { id: String(row.id), ...parsed }]] : [];
           }));
         }
-        const { data: workingPlaceData, error: workingPlaceError } = await supabase.from("weekly_working_places").select("id, weekday, place").eq("user_id", userId).order("weekday");
+        const { data: workingPlaceData, error: workingPlaceError } = await database.listWorkingPlaces();
         if (workingPlaceError) {
           loadLocalWorkingPlaces();
           if (!cancelled) setAvailabilityError("Cloud availability or workplaces are not ready yet; local values are being used.");
@@ -628,7 +568,7 @@ export default function Home() {
   }, [availabilityEditMode, availabilityWeekDate, selectedAvailabilityWeekStart, userId]);
 
   useEffect(() => {
-    if (hasLoadedLessons.current && !supabaseConfigured) {
+    if (hasLoadedLessons.current && !cloudConfigured) {
       window.localStorage.setItem(`${storageKey}-${selectedDate}`, JSON.stringify(lessons));
     }
   }, [lessons, selectedDate]);
@@ -698,7 +638,7 @@ export default function Home() {
     if (availabilityEditMode !== "week" || !availabilityOverrides[selectedAvailabilityWeekStart]) return;
     setAvailabilitySaving(true);
     setAvailabilityError("");
-    if (!supabaseConfigured) {
+    if (!cloudConfigured) {
       window.localStorage.removeItem(weeklyAvailabilityOverrideStorageKey(selectedAvailabilityWeekStart));
       const nextOverrides = { ...availabilityOverrides };
       delete nextOverrides[selectedAvailabilityWeekStart];
@@ -715,7 +655,7 @@ export default function Home() {
       setAvailabilityError("Your session is still loading. Try again in a moment.");
       return;
     }
-    const { error } = await createClient().from("weekly_availability_overrides").delete().eq("user_id", userId).eq("week_start", selectedAvailabilityWeekStart);
+    const { error } = await database.deleteAvailabilityOverride(selectedAvailabilityWeekStart);
     setAvailabilitySaving(false);
     if (error) {
       setAvailabilityError("The week could not be reverted. Your existing values are unchanged.");
@@ -742,7 +682,7 @@ export default function Home() {
     }
     setAvailabilitySaving(true);
     setAvailabilityError("");
-    if (!supabaseConfigured) {
+    if (!cloudConfigured) {
       if (availabilityEditMode === "default") {
         window.localStorage.setItem(weeklyAvailabilityStorageKey, JSON.stringify(availability));
         setAvailabilityDefault(availability);
@@ -764,31 +704,16 @@ export default function Home() {
       setAvailabilityError("Your session is still loading. Try again in a moment.");
       return;
     }
-    const supabase = createClient();
-    const availabilityResult = availabilityEditMode === "default"
-      ? await supabase.from("weekly_availability").delete().eq("user_id", userId).then(async ({ error: deleteError }) => deleteError
-        ? { error: deleteError }
-        : availability.length
-          ? await supabase.from("weekly_availability").insert(availability.map((interval) => ({ user_id: userId, weekday: interval.weekday, starts: interval.starts, ends: interval.ends })))
-          : { error: null })
-      : await supabase.from("weekly_availability_overrides").upsert({ user_id: userId, week_start: selectedAvailabilityWeekStart, intervals: availability }, { onConflict: "user_id,week_start" });
-    const { error: workingPlaceDeleteError } = availabilityResult.error
-      ? { error: availabilityResult.error }
-      : await supabase.from("weekly_working_places").delete().eq("user_id", userId);
     const workingPlaceRows = Object.entries(workingPlaces)
       .filter(([, place]) => Boolean(place?.trim()))
-      .map(([weekday, place]) => ({ user_id: userId, weekday: Number(weekday), place: place?.trim() ?? "" }));
-    const { error: workingPlaceInsertError } = workingPlaceDeleteError
-      ? { error: workingPlaceDeleteError }
-      : workingPlaceRows.length
-        ? await supabase.from("weekly_working_places").insert(workingPlaceRows)
-        : { error: null };
+      .map(([weekday, place]) => ({ weekday: Number(weekday), place: place?.trim() ?? "" }));
+    const availabilityResult = await database.saveAvailability(availability, workingPlaceRows, availabilityEditMode === "default" ? undefined : selectedAvailabilityWeekStart);
     setAvailabilitySaving(false);
-    if (availabilityResult.error || workingPlaceInsertError) {
+    if (availabilityResult.error) {
       if (availabilityEditMode === "default") window.localStorage.setItem(weeklyAvailabilityStorageKey, JSON.stringify(availability));
       else window.localStorage.setItem(weeklyAvailabilityOverrideStorageKey(selectedAvailabilityWeekStart), JSON.stringify(availability));
       saveLocalWorkingPlaces();
-      setAvailabilityError("Cloud availability is not ready yet; your changes are saved in this browser.");
+      setAvailabilityError("Cloud save failed: " + availabilityResult.error.message + " Your changes are retained in this browser; retry to sync them.");
       return;
     }
     if (availabilityEditMode === "default") setAvailabilityDefault(availability);
@@ -951,17 +876,13 @@ export default function Home() {
       setLessonFormError("That time overlaps an existing event.");
       return;
     }
-    if (supabaseConfigured) {
+    if (cloudConfigured) {
       if (!userId) {
         setLessonFormError("Your session is still loading. Try again in a moment.");
         return;
       }
       setIsCloudSaving(true);
-      const supabase = createClient();
-      const { error: scheduleError } = await supabase.from("schedule_events").upsert(lessonToScheduleRow(lesson, userId, lessonFormDate));
-      const error = scheduleError
-        ? (await supabase.from("lessons").upsert(lessonToRow(lesson, userId, lessonFormDate))).error
-        : null;
+      const { error } = await database.saveEvent(lessonToScheduleRow(lesson, userId, lessonFormDate));
       setIsCloudSaving(false);
       if (error) {
         setLessonFormError(error.message);
@@ -979,13 +900,9 @@ export default function Home() {
 
   const deleteLesson = async () => {
     if (!editingLesson) return;
-    if (supabaseConfigured) {
+    if (cloudConfigured) {
       setIsCloudSaving(true);
-      const supabase = createClient();
-      const canonical = await supabase.from("schedule_events").delete().eq("id", editingLesson.id);
-      const error = canonical.error
-        ? (await supabase.from("lessons").delete().eq("id", editingLesson.id)).error
-        : null;
+      const { error } = await database.deleteEvent(editingLesson.id);
       setIsCloudSaving(false);
       if (error) {
         setLessonFormError(error.message);
@@ -1002,13 +919,13 @@ export default function Home() {
   };
 
   const signOut = async () => {
-    if (supabaseConfigured) await createClient().auth.signOut();
+    if (cloudConfigured) await database.auth.signOut();
     router.push("/login");
     router.refresh();
   };
 
   const localLessonHours = lessons.filter((lesson) => lesson.kind === "lesson").reduce((total, lesson) => total + (minutesFromTime(lesson.end) - minutesFromTime(lesson.time)) / 60, 0);
-  const displayedWeeklyLessonHours = supabaseConfigured ? weeklyLessonHours : localLessonHours;
+  const displayedWeeklyLessonHours = cloudConfigured ? weeklyLessonHours : localLessonHours;
   const weeklyStamina = staminaState(displayedWeeklyLessonHours);
   const weeklyStaminaMeter = Math.min(100, Math.round((displayedWeeklyLessonHours / 25) * 100));
   const currentEarnings = monthlyCompletedEarnings;
@@ -1025,7 +942,7 @@ export default function Home() {
 
         <div className="profile-switcher">
           <div className="avatar avatar-sage">{initials(displayName)}</div>
-          <div><strong>{displayName}</strong><span>{supabaseConfigured ? userEmail || "Loading account..." : "Local workspace"}</span></div>
+          <div><strong>{displayName}</strong><span>{cloudConfigured ? userEmail || "Loading account..." : "Local workspace"}</span></div>
           <ChevronDown size={15} className="muted-icon" />
         </div>
 
@@ -1046,8 +963,8 @@ export default function Home() {
             <div><strong>Protect your energy</strong><span>Keep an eye on your weekly load.</span></div>
           </div>
           <button className="nav-item" onClick={() => { setMobileMenuOpen(false); router.push("/settings"); }}><Settings2 size={18} /><span>Settings</span></button>
-          {supabaseConfigured && <button className="nav-item" onClick={signOut}><LogOut size={18} /><span>Sign out</span></button>}
-          <div className="sidebar-footer"><span className="status-dot" /> {isCloudSaving ? "Saving changes..." : supabaseConfigured ? "Synced to cloud" : "Saved in this browser"} <span>v0.2</span></div>
+          {cloudConfigured && <button className="nav-item" onClick={signOut}><LogOut size={18} /><span>Sign out</span></button>}
+          <div className="sidebar-footer"><span className="status-dot" /> {isCloudSaving ? "Saving changes..." : cloudConfigured ? "Synced to cloud" : "Saved in this browser"} <span>v0.2</span></div>
         </div>
       </aside>
 

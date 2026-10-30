@@ -3,7 +3,7 @@
 import { FormEvent, useEffect, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { CalendarDays, ChevronLeft, ChevronRight, Clock3, Plus, Sparkles, X } from "lucide-react";
-import { createClient } from "@/lib/supabase/client";
+import { database, cloudConfigured } from "@/lib/data/client";
 import { deleteGoogleCalendarEvent, syncGoogleCalendarEvent, syncGoogleCalendarOccurrence } from "@/lib/google-calendar/client";
 import { slotConflicts } from "@/lib/schedule/availability";
 import { addDays, dateKey, dateFromKey, formatRangeLabel, rangeForView } from "@/lib/schedule/dates";
@@ -44,7 +44,6 @@ const getBrowserStudentQuery = () => new URLSearchParams(window.location.search)
 const getInitialStudentQuery = () => "";
 const storageKey = "daylight-lessons";
 const scheduleChangedEvent = "daylight-schedule-changed";
-const supabaseConfigured = Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY);
 const CALENDAR_START_MINUTES = 7 * 60;
 const CALENDAR_END_MINUTES = 22 * 60;
 const CALENDAR_INTERVAL_MINUTES = 30;
@@ -210,7 +209,7 @@ export default function CalendarPage() {
     const load = async () => {
       setLoading(true);
       setError("");
-        if (!supabaseConfigured) {
+        if (!cloudConfigured) {
           const localEvents: ScheduleEvent[] = [];
           for (let day = new Date(rangeStartMs); day < new Date(rangeEndMs); day = addDays(day, 1)) {
             const dayKey = dateKey(day);
@@ -248,15 +247,15 @@ export default function CalendarPage() {
           }
           return;
         }
-      const supabase = createClient();
-      const { data: authData, error: authError } = await supabase.auth.getUser();
+      const { data: authData, error: authError } = await database.auth.getUser();
       if (cancelled) return;
       if (authError || !authData.user) {
         router.push("/login");
         return;
       }
       setUserId(authData.user.id);
-      const { data: profile } = await supabase.from("profiles").select("timezone, default_lesson_rate, default_travel_minutes, default_lesson_tone, default_personal_tone").eq("id", authData.user.id).maybeSingle();
+      const { data: profile, error: profileError } = await database.getProfile();
+      if (profileError && !cancelled) setError(profileError.message);
       if (!cancelled && profile) {
         if (profile.timezone) setProfileTimezone(profile.timezone);
         if (profile.default_lesson_rate !== null && profile.default_lesson_rate !== undefined) setDefaultLessonRate(Number(profile.default_lesson_rate));
@@ -264,15 +263,14 @@ export default function CalendarPage() {
         if (profile.default_lesson_tone) setDefaultLessonTone(profile.default_lesson_tone as EventTone);
         if (profile.default_personal_tone) setDefaultPersonalTone(profile.default_personal_tone as EventTone);
       }
-      const { data: studentData, error: studentError } = await supabase.from("students").select("id, user_id, name, email, phone, notes, status").order("name");
-      const studentSchemaError = Boolean(studentError && /students|student_id|schema cache|column/i.test(studentError.message));
-      if (studentSchemaError && !cancelled) setError("Apply migration 005 to enable student-calendar sync.");
+      const { data: studentData, error: studentError } = await database.listStudents();
+      if (studentError && !cancelled) setError(studentError.message);
       if (!cancelled) {
         const directory = (studentData ?? []).map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" as const : "active" as const }));
         setStudentDirectory(directory);
         setStudents(directory.filter((student) => student.status === "active"));
       }
-      const { data: workingPlaceData, error: workingPlaceError } = await supabase.from("weekly_working_places").select("id, weekday, place").eq("user_id", authData.user.id).order("weekday");
+      const { data: workingPlaceData, error: workingPlaceError } = await database.listWorkingPlaces();
       if (!cancelled) {
         if (workingPlaceError) {
           const storedWorkingPlaces = window.localStorage.getItem(workingPlaceStorageKey);
@@ -289,38 +287,21 @@ export default function CalendarPage() {
         }
       }
 
-      const { data, error: eventError } = await supabase
-        .from("schedule_events")
-        .select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id")
-        .lt("starts_at", new Date(rangeEndMs).toISOString())
-        .order("starts_at", { ascending: true });
+      const { data, error: eventError } = await database.listEvents({ start: new Date(rangeStartMs), end: new Date(rangeEndMs) });
 
       const canonicalRows = eventError ? [] : (data ?? []);
-      const legacyResult = await supabase
-        .from("lessons")
-        .select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id")
-        .gte("starts_at", new Date(rangeStartMs).toISOString())
-        .lt("starts_at", new Date(rangeEndMs).toISOString())
-        .order("starts_at", { ascending: true });
-
       if (!cancelled) {
-        if (eventError && legacyResult.error) {
-          setError(studentSchemaError ? "Apply migration 005 to enable student-calendar sync." : "Apply migration 002 to enable the calendar event store.");
+        if (eventError) {
+          setError(eventError.message);
           setEvents([]);
           setExceptions([]);
         } else {
-          const canonicalIds = new Set(canonicalRows.map((row) => String(row.id)));
           const canonicalEvents = canonicalRows.map((row) => eventFromRow(row, authData.user.id));
-          const legacyEvents = (legacyResult.data ?? [])
-            .filter((row) => !canonicalIds.has(String(row.id)))
-            .map((row) => eventFromRow(row, authData.user.id));
-          setEvents([...canonicalEvents, ...legacyEvents].sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime()));
+          setEvents(canonicalEvents);
 
           if (canonicalRows.length) {
-            const { data: exceptionData } = await supabase
-              .from("schedule_event_exceptions")
-              .select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee")
-              .in("event_id", canonicalRows.map((row) => row.id));
+            const { data: exceptionData, error: exceptionError } = await database.listExceptions(canonicalRows.map((row) => row.id));
+            if (exceptionError && !cancelled) setError(exceptionError.message);
             if (!cancelled) setExceptions((exceptionData ?? []).map((row) => exceptionFromRow(row)));
           } else {
             setExceptions([]);
@@ -393,9 +374,9 @@ export default function CalendarPage() {
       student_id: form.studentId || null,
     };
 
-    if (!supabaseConfigured) {
+    if (!cloudConfigured) {
       if (form.recurring) {
-        setError("Recurring events are available after connecting Supabase.");
+        setError("Recurring events are available after connecting Firebase.");
         return;
       }
       const id = editingOccurrence?.id ?? crypto.randomUUID();
@@ -425,12 +406,10 @@ export default function CalendarPage() {
       await syncSavedEvent(savedLocalEvent);
       return;
     }
-
-    const supabase = createClient();
     let savedEventForGoogle: ScheduleEvent | null = null;
 
     if (editingOccurrence && scope === "occurrence") {
-      const { data, error: exceptionError } = await supabase.from("schedule_event_exceptions").upsert({
+      const { data, error: exceptionError } = await database.saveException({
         event_id: editingOccurrence.id,
         original_starts_at: editingOccurrence.originalStartsAt,
         starts_at: payload.starts_at,
@@ -443,9 +422,9 @@ export default function CalendarPage() {
         hourly_rate: payload.hourly_rate,
         fixed_fee: payload.fixed_fee,
           status: payload.status,
-      }, { onConflict: "event_id,original_starts_at" }).select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").single();
+      });
       if (exceptionError) {
-        setError(exceptionError.message || "Apply migration 004 to edit one recurring occurrence.");
+        setError(exceptionError.message || "The occurrence could not be saved.");
         return;
       }
       setExceptions((current) => [...current.filter((item) => !(item.eventId === editingOccurrence.id && item.originalStartsAt === editingOccurrence.originalStartsAt)), exceptionFromRow(data)]);
@@ -472,30 +451,16 @@ export default function CalendarPage() {
       }
     } else if (editingOccurrence) {
       if (scope === "all" && editingOccurrence.exceptionId) {
-        const { error: exceptionDeleteError } = await supabase.from("schedule_event_exceptions").delete().eq("id", editingOccurrence.exceptionId);
+        const { error: exceptionDeleteError } = await database.deleteException(editingOccurrence.exceptionId);
         if (exceptionDeleteError) {
           setError(exceptionDeleteError.message);
           return;
         }
         setExceptions((current) => current.filter((item) => item.id !== editingOccurrence.exceptionId));
       }
-      const { error: updateError } = await supabase.from("schedule_events").update(payload).eq("id", editingOccurrence.id);
-      const error = updateError
-        ? (await supabase.from("lessons").update({
-          starts_at: payload.starts_at,
-          ends_at: payload.ends_at,
-          title: payload.title,
-          detail: payload.detail,
-          kind: payload.kind,
-          tone: payload.tone,
-          travel_minutes: payload.travel_minutes,
-          hourly_rate: payload.hourly_rate,
-          status: payload.status === "completed" ? "completed" : "scheduled",
-          student_id: payload.student_id,
-        }).eq("id", editingOccurrence.id)).error
-        : null;
+      const { error } = await database.updateEvent(editingOccurrence.id, payload);
       if (error) {
-        setError(error.message || updateError?.message || "The event could not be updated.");
+        setError(error.message || "The event could not be updated.");
         return;
       }
       const updatedEvent = eventFromRow({
@@ -522,46 +487,13 @@ export default function CalendarPage() {
       savedEventForGoogle = updatedEvent;
       setNotice(scope === "all" ? "The recurring series was updated." : "Event updated.");
     } else {
-      const { data: insertedRow, error: saveError } = await supabase.from("schedule_events").insert(payload).select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id").single();
-      let fallbackRow: Record<string, unknown> | null = null;
+      const { data: insertedRow, error: saveError } = await database.saveEvent(payload);
       if (saveError) {
-        if (form.recurring) {
-          setError("Recurring events need migration 002 applied in Supabase.");
-          return;
-        }
-        const fallback = await supabase.from("lessons").insert({
-          id: crypto.randomUUID(),
-          user_id: userId,
-          starts_at: startsAt.toISOString(),
-          ends_at: endsAt.toISOString(),
-          title: payload.title,
-          detail: payload.detail,
-          kind: payload.kind,
-          tone: payload.tone,
-          intensity: 2,
-          prep_minutes: 0,
-          travel_minutes: payload.travel_minutes,
-          hourly_rate: payload.hourly_rate,
-          status: payload.status === "completed" ? "completed" : "scheduled",
-          student_id: payload.student_id,
-        }).select("id, user_id, starts_at, ends_at, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, status, student_id").single();
-        if (fallback.error) {
-          setError(fallback.error.message || saveError.message);
-          return;
-        }
-        fallbackRow = fallback.data;
+        setError(saveError.message);
+        return;
       }
-      if (fallbackRow) {
-        savedEventForGoogle = eventFromRow(fallbackRow, userId);
-        setEvents((current) => [...current, savedEventForGoogle as ScheduleEvent]);
-      } else if (insertedRow) {
-        savedEventForGoogle = eventFromRow(insertedRow, userId);
-        setEvents((current) => [...current, savedEventForGoogle as ScheduleEvent]);
-      }
-      else {
-        const { data } = await supabase.from("schedule_events").select("id, user_id, starts_at, ends_at, timezone, title, detail, kind, tone, intensity, prep_minutes, travel_minutes, hourly_rate, fixed_fee, status, recurrence_weekdays, recurrence_until, student_id").lt("starts_at", new Date(rangeEndMs).toISOString()).order("starts_at", { ascending: true });
-        if (data) setEvents(data.map((row) => eventFromRow(row, userId)));
-      }
+      savedEventForGoogle = eventFromRow(insertedRow, userId);
+      setEvents((current) => [...current, savedEventForGoogle as ScheduleEvent]);
       setNotice(form.recurring ? "Weekly event added to your calendar." : "Event added to your calendar.");
     }
     setEditorOpen(false);
@@ -637,7 +569,7 @@ export default function CalendarPage() {
     if (!selectedOccurrence) return;
     setDeleting(true);
     setError("");
-    if (!supabaseConfigured) {
+    if (!cloudConfigured) {
       const dayKey = dateKey(new Date(selectedOccurrence.startsAt));
       const stored = window.localStorage.getItem(`${storageKey}-${dayKey}`);
       if (stored) {
@@ -657,27 +589,24 @@ export default function CalendarPage() {
       await syncDeletedEvent(selectedOccurrence);
       return;
     }
-    const supabase = createClient();
     const baseEvent = events.find((event) => event.id === selectedOccurrence.id);
     const isFirstOccurrence = Boolean(baseEvent && new Date(baseEvent.startsAt).getTime() === new Date(selectedOccurrence.originalStartsAt).getTime());
     let deleteError: Error | null = null;
-    let deletedParent = false;
-    let deletedLegacy = false;
     let updatedFollowingEvent: ScheduleEvent | null = null;
 
     if (selectedOccurrence.isRecurring && scope === "occurrence") {
-      const result = await supabase.from("schedule_event_exceptions").upsert({
+      const result = await database.saveException({
         event_id: selectedOccurrence.id,
         original_starts_at: selectedOccurrence.originalStartsAt,
         status: "cancelled",
-      }, { onConflict: "event_id,original_starts_at" }).select("id, event_id, original_starts_at, starts_at, ends_at, status, title, detail, kind, tone, travel_minutes, hourly_rate, fixed_fee").single();
+      });
       deleteError = result.error;
       if (!deleteError && result.data) {
         setExceptions((current) => [...current.filter((item) => !(item.eventId === selectedOccurrence.id && item.originalStartsAt === selectedOccurrence.originalStartsAt)), exceptionFromRow(result.data)]);
       }
     } else if (selectedOccurrence.isRecurring && scope === "following" && !isFirstOccurrence) {
       const cutoff = dateKey(addDays(dateFromKey(dateKey(new Date(selectedOccurrence.originalStartsAt))), -1));
-      const result = await supabase.from("schedule_events").update({ recurrence_until: cutoff }).eq("id", selectedOccurrence.id).select("id, recurrence_until").single();
+      const result = await database.updateEvent(selectedOccurrence.id, { recurrence_until: cutoff });
       deleteError = result.error;
       if (!deleteError) {
         setEvents((current) => current.map((event) => event.id === selectedOccurrence.id ? { ...event, recurrenceUntil: cutoff } : event));
@@ -685,13 +614,8 @@ export default function CalendarPage() {
         if (baseEvent) updatedFollowingEvent = { ...baseEvent, recurrenceUntil: cutoff };
       }
     } else {
-      const canonicalResult = await supabase.from("schedule_events").delete().eq("id", selectedOccurrence.id).select("id");
-      deletedParent = !canonicalResult.error && (canonicalResult.data?.length ?? 0) > 0;
-      const legacyResult = await supabase.from("lessons").delete().eq("id", selectedOccurrence.id).select("id");
-      deletedLegacy = !legacyResult.error && (legacyResult.data?.length ?? 0) > 0;
-      if (!deletedParent && !deletedLegacy) {
-        deleteError = canonicalResult.error ?? legacyResult.error ?? new Error("The event could not be found for deletion.");
-      }
+      const result = await database.deleteEvent(selectedOccurrence.id);
+      deleteError = result.error;
       if (!deleteError) {
         setEvents((current) => current.filter((event) => event.id !== selectedOccurrence.id));
         setExceptions((current) => current.filter((exception) => exception.eventId !== selectedOccurrence.id));
