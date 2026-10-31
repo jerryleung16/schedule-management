@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { ArrowLeft, CalendarDays, Check, Clock3, Link2, Save, Sparkles, Unlink2, UserRound } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { database, cloudConfigured } from "@/lib/data/client";
-import { connectGoogleCalendar, disconnectGoogleCalendar, googleCalendarConfigured, googleCalendarIsConnected, prepareGoogleCalendar, syncGoogleCalendarEvent } from "@/lib/google-calendar/client";
+import { connectGoogleCalendar, disconnectGoogleCalendar, googleCalendarConfigured, googleCalendarIsConnected, googleCalendarNeedsReconnect, prepareGoogleCalendar, syncGoogleCalendarEvent, syncGoogleCalendarOccurrence } from "@/lib/google-calendar/client";
 import type { EventStatus, EventTone, ScheduleEvent, SchedulePreferences } from "@/lib/schedule/types";
 
 const storageKey = "daylight-settings";
@@ -64,12 +64,19 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [googleConnected, setGoogleConnected] = useState(false);
+  const [googleReady, setGoogleReady] = useState(false);
   const [googleBusy, setGoogleBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
   useEffect(() => {
-    void prepareGoogleCalendar().catch(() => undefined);
+    let cancelled = false;
+    void prepareGoogleCalendar().then(() => {
+      if (!cancelled) setGoogleReady(true);
+    }).catch(() => {
+      if (!cancelled) setError("Google sign-in could not load. Reload this page to reconnect Calendar.");
+    });
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -160,16 +167,38 @@ export default function SettingsPage() {
     try {
       await connectGoogleCalendar(userId);
       let syncedExistingEvents = 0;
+      let syncedExistingOccurrences = 0;
       if (cloudConfigured && userId !== "local") {
         const { data: existingEvents, error: eventsError } = await database.listEvents();
         if (eventsError) throw new Error(`Google Calendar connected, but existing events could not be loaded: ${eventsError.message}`);
-        for (const row of existingEvents ?? []) {
-          await syncGoogleCalendarEvent(scheduleEventFromRow(row, userId));
+        const eventRows = existingEvents ?? [];
+        const scheduleEvents = new Map(eventRows.map((row) => [row.id, scheduleEventFromRow(row, userId)]));
+        for (const event of scheduleEvents.values()) {
+          await syncGoogleCalendarEvent(event);
           syncedExistingEvents += 1;
+        }
+        const { data: exceptions, error: exceptionsError } = await database.listExceptions(eventRows.map((row) => row.id));
+        if (exceptionsError) throw new Error(`Google Calendar connected, but occurrence changes could not be loaded: ${exceptionsError.message}`);
+        for (const row of exceptions ?? []) {
+          const event = scheduleEvents.get(row.event_id);
+          if (!event?.recurrenceWeekdays.length) continue;
+          await syncGoogleCalendarOccurrence(event, row.original_starts_at, {
+            startsAt: row.starts_at,
+            endsAt: row.ends_at,
+            title: row.title,
+            detail: row.detail,
+            kind: row.kind,
+            tone: row.tone,
+            travelMinutes: row.travel_minutes,
+            hourlyRate: row.hourly_rate,
+            fixedFee: row.fixed_fee,
+            status: row.status,
+          });
+          syncedExistingOccurrences += 1;
         }
       }
       setGoogleConnected(true);
-      setNotice(`Google Calendar connected. ${syncedExistingEvents} existing event${syncedExistingEvents === 1 ? "" : "s"} synced; new schedule events will sync one way to your calendar.`);
+      setNotice(`Google Calendar connected. ${syncedExistingEvents} existing event${syncedExistingEvents === 1 ? "" : "s"} and ${syncedExistingOccurrences} occurrence change${syncedExistingOccurrences === 1 ? "" : "s"} synced.`);
     } catch (connectError) {
       setError(connectError instanceof Error ? connectError.message : "Google Calendar could not be connected.");
     } finally {
@@ -186,6 +215,8 @@ export default function SettingsPage() {
     setNotice("Google Calendar disconnected. Existing Google events were left untouched.");
   };
 
+  const googleReconnectRequired = googleCalendarNeedsReconnect(userId);
+
   return (
     <main className="calendar-shell">
       <header className="calendar-topbar">
@@ -201,7 +232,7 @@ export default function SettingsPage() {
           <section className="panel settings-card"><div className="panel-heading"><div><p className="section-kicker">Profile</p><h2>Your details</h2></div><UserRound size={20} className="panel-icon" /></div><div className="settings-card-body"><label className="form-field"><span>Display name</span><input value={form.displayName} onChange={(event) => update("displayName", event.target.value)} /></label><label className="form-field"><span>Timezone</span><input value={form.timezone} onChange={(event) => update("timezone", event.target.value)} placeholder="e.g. Asia/Hong_Kong" /></label></div></section>
           <section className="panel settings-card"><div className="panel-heading"><div><p className="section-kicker">Energy</p><h2>Workload limits</h2></div><Clock3 size={20} className="panel-icon" /></div><div className="settings-card-body settings-two-column"><label className="form-field"><span>Daily stamina limit</span><input type="number" min="0" step="0.5" value={form.dailyStaminaLimit} onChange={(event) => update("dailyStaminaLimit", Number(event.target.value))} /></label><label className="form-field"><span>Weekly stamina limit</span><input type="number" min="0" step="0.5" value={form.weeklyStaminaLimit} onChange={(event) => update("weeklyStaminaLimit", Number(event.target.value))} /></label></div></section>
           <section className="panel settings-card settings-card-wide"><div className="panel-heading"><div><p className="section-kicker">New event defaults</p><h2>Start with less setup</h2></div><Sparkles size={20} className="panel-icon" /></div><div className="settings-card-body settings-two-column"><label className="form-field"><span>Default lesson rate</span><input type="number" min="0" step="0.5" value={form.defaultLessonRate} onChange={(event) => update("defaultLessonRate", Number(event.target.value))} /></label><label className="form-field"><span>Default travel minutes</span><input type="number" min="0" value={form.defaultTravelMinutes} onChange={(event) => update("defaultTravelMinutes", Number(event.target.value))} /></label><div className="tone-picker form-field"><span className="form-field-label">Lesson color</span><div>{tones.map((tone) => <button type="button" key={tone} aria-label={`Use ${tone} for lessons`} className={`tone-swatch tone-${tone} ${form.defaultLessonTone === tone ? "tone-selected" : ""}`} onClick={() => update("defaultLessonTone", tone)} />)}</div></div><div className="tone-picker form-field"><span className="form-field-label">Personal color</span><div>{tones.map((tone) => <button type="button" key={tone} aria-label={`Use ${tone} for personal events`} className={`tone-swatch tone-${tone} ${form.defaultPersonalTone === tone ? "tone-selected" : ""}`} onClick={() => update("defaultPersonalTone", tone)} />)}</div></div></div></section>
-          <section className="panel settings-card settings-card-wide"><div className="panel-heading"><div><p className="section-kicker">Calendar connection</p><h2>Send events to Google Calendar</h2></div><CalendarDays size={20} className="panel-icon" /></div><div className="settings-card-body google-calendar-settings"><div><p className="google-calendar-status"><span className={googleConnected ? "google-status-dot google-status-connected" : "google-status-dot"} /> {googleConnected ? "Connected" : "Not connected"}</p><p className="settings-help">Daylight can create, update, and remove events in your primary Google Calendar. Changes made in Google Calendar never come back into Daylight.</p>{!googleCalendarConfigured() && <p className="settings-help">Add <code>NEXT_PUBLIC_GOOGLE_CLIENT_ID</code> to your environment and configure this site as an authorized JavaScript origin in Google Cloud.</p>}</div><div className="google-calendar-actions">{googleConnected ? <button type="button" className="secondary-button" disabled={googleBusy} onClick={() => void disconnectGoogle()}><Unlink2 size={15} /> {googleBusy ? "Disconnecting..." : "Disconnect Google Calendar"}</button> : <button type="button" className="primary-button" disabled={googleBusy || !googleCalendarConfigured()} onClick={() => void connectGoogle()}><Link2 size={15} /> {googleBusy ? "Connecting..." : "Connect Google Calendar"}</button>}</div></div></section>
+          <section className="panel settings-card settings-card-wide"><div className="panel-heading"><div><p className="section-kicker">Calendar connection</p><h2>Send events to Google Calendar</h2></div><CalendarDays size={20} className="panel-icon" /></div><div className="settings-card-body google-calendar-settings"><div><p className="google-calendar-status"><span className={googleConnected ? "google-status-dot google-status-connected" : "google-status-dot"} /> {googleConnected ? "Connected" : googleReconnectRequired ? "Reconnect required" : "Not connected"}</p><p className="settings-help">Daylight can create, update, and remove events in your primary Google Calendar. Changes made in Google Calendar never come back into Daylight.</p>{googleReconnectRequired && <p className="settings-help">Your Google Calendar authorization expired. Reconnect to sync saved events.</p>}{!googleCalendarConfigured() && <p className="settings-help">Add <code>NEXT_PUBLIC_GOOGLE_CLIENT_ID</code> to your environment and configure this site as an authorized JavaScript origin in Google Cloud.</p>}</div><div className="google-calendar-actions">{googleConnected ? <button type="button" className="secondary-button" disabled={googleBusy} onClick={() => void disconnectGoogle()}><Unlink2 size={15} /> {googleBusy ? "Disconnecting..." : "Disconnect Google Calendar"}</button> : <button type="button" className="primary-button" disabled={googleBusy || !googleCalendarConfigured() || !googleReady} onClick={() => void connectGoogle()}><Link2 size={15} /> {googleBusy ? "Connecting..." : googleReconnectRequired ? "Reconnect Google Calendar" : "Connect Google Calendar"}</button>}</div></div></section>
           <div className="settings-actions"><span /><button type="submit" className="primary-button" disabled={saving}><Save size={15} /> {saving ? "Saving..." : "Save settings"}</button></div>
         </form>}
       </div>

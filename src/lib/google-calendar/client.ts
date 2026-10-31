@@ -102,9 +102,10 @@ export function prepareGoogleCalendar() {
   return loadGoogleIdentityServices();
 }
 
-async function requestAccessToken(prompt = "") {
+async function requestAccessToken(allowPopup = false) {
   const stored = loadStoredToken();
   if (stored) return stored.accessToken;
+  if (!allowPopup) throw new Error("Google Calendar authorization expired. Reconnect in Settings to sync your saved events.");
   if (!googleClientId()) throw new Error("Add NEXT_PUBLIC_GOOGLE_CLIENT_ID to enable Google Calendar sync.");
   if (!window.google?.accounts?.oauth2) await loadGoogleIdentityServices();
   return new Promise<string>((resolve, reject) => {
@@ -127,7 +128,7 @@ async function requestAccessToken(prompt = "") {
       reject(new Error("Google sign-in could not be initialized."));
       return;
     }
-    tokenClient.requestAccessToken({ prompt });
+    tokenClient.requestAccessToken({ prompt: "" });
   });
 }
 
@@ -240,12 +241,16 @@ export function googleCalendarConfigured() {
 }
 
 export function googleCalendarIsConnected(userId: string) {
-  return connectionForUser(userId);
+  return connectionForUser(userId) && Boolean(loadStoredToken());
+}
+
+export function googleCalendarNeedsReconnect(userId: string) {
+  return connectionForUser(userId) && !loadStoredToken();
 }
 
 export async function connectGoogleCalendar(userId: string) {
   if (!googleClientId()) throw new Error("Add NEXT_PUBLIC_GOOGLE_CLIENT_ID to enable Google Calendar sync.");
-  await requestAccessToken();
+  await requestAccessToken(true);
   await googleFetch("/calendars/primary/events?maxResults=1&showDeleted=false");
   setConnection(userId);
 }
@@ -259,7 +264,7 @@ export async function disconnectGoogleCalendar() {
 }
 
 export async function syncGoogleCalendarEvent(event: ScheduleEvent): Promise<GoogleCalendarSyncResult> {
-  if (!googleCalendarIsConnected(event.userId)) return "not-connected";
+  if (!connectionForUser(event.userId)) return "not-connected";
   const existingId = await findGoogleEventId(event);
   if (event.status === "cancelled" || event.status === "skipped") {
     if (existingId) {
@@ -279,7 +284,7 @@ export async function syncGoogleCalendarEvent(event: ScheduleEvent): Promise<Goo
 }
 
 export async function deleteGoogleCalendarEvent(event: ScheduleEvent) {
-  if (!googleCalendarIsConnected(event.userId)) return "not-connected" as GoogleCalendarSyncResult;
+  if (!connectionForUser(event.userId)) return "not-connected" as GoogleCalendarSyncResult;
   const existingId = await findGoogleEventId(event);
   if (existingId) {
     await googleFetch(`/calendars/primary/events/${encodeURIComponent(existingId)}`, { method: "DELETE" });
@@ -289,7 +294,7 @@ export async function deleteGoogleCalendarEvent(event: ScheduleEvent) {
 }
 
 export async function syncGoogleCalendarOccurrence(event: ScheduleEvent, originalStartsAt: string, change: GoogleCalendarOccurrenceChange): Promise<GoogleCalendarSyncResult> {
-  if (!googleCalendarIsConnected(event.userId)) return "not-connected";
+  if (!connectionForUser(event.userId)) return "not-connected";
   const recurringEventId = await findGoogleEventId(event);
   if (!recurringEventId) return "synced";
   const timeMin = new Date(new Date(originalStartsAt).getTime() - 86400000).toISOString();
