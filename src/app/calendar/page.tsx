@@ -254,7 +254,14 @@ export default function CalendarPage() {
         return;
       }
       setUserId(authData.user.id);
-      const { data: profile, error: profileError } = await database.getProfile();
+      const [profileResult, studentResult, workingPlaceResult, eventResult] = await Promise.all([
+        database.getProfile(),
+        database.listStudents(),
+        database.listWorkingPlaces(),
+        database.listEvents({ start: new Date(rangeStartMs), end: new Date(rangeEndMs) }),
+      ]);
+      if (cancelled) return;
+      const { data: profile, error: profileError } = profileResult;
       if (profileError && !cancelled) setError(profileError.message);
       if (!cancelled && profile) {
         if (profile.timezone) setProfileTimezone(profile.timezone);
@@ -263,14 +270,14 @@ export default function CalendarPage() {
         if (profile.default_lesson_tone) setDefaultLessonTone(profile.default_lesson_tone as EventTone);
         if (profile.default_personal_tone) setDefaultPersonalTone(profile.default_personal_tone as EventTone);
       }
-      const { data: studentData, error: studentError } = await database.listStudents();
+      const { data: studentData, error: studentError } = studentResult;
       if (studentError && !cancelled) setError(studentError.message);
       if (!cancelled) {
         const directory = (studentData ?? []).map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" as const : "active" as const }));
         setStudentDirectory(directory);
         setStudents(directory.filter((student) => student.status === "active"));
       }
-      const { data: workingPlaceData, error: workingPlaceError } = await database.listWorkingPlaces();
+      const { data: workingPlaceData, error: workingPlaceError } = workingPlaceResult;
       if (!cancelled) {
         if (workingPlaceError) {
           const storedWorkingPlaces = window.localStorage.getItem(workingPlaceStorageKey);
@@ -287,7 +294,7 @@ export default function CalendarPage() {
         }
       }
 
-      const { data, error: eventError } = await database.listEvents({ start: new Date(rangeStartMs), end: new Date(rangeEndMs) });
+      const { data, error: eventError } = eventResult;
 
       const canonicalRows = eventError ? [] : (data ?? []);
       if (!cancelled) {

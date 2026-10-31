@@ -78,6 +78,7 @@ export default function StudentsPage() {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<StudentStatus | "all">("active");
   const [loading, setLoading] = useState(true);
+  const [summariesLoading, setSummariesLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -108,6 +109,7 @@ export default function StudentsPage() {
           } catch { }
         }
         setSummaries(summarizeOccurrences(localStudents, localOccurrences, now));
+        setSummariesLoading(false);
         if (!cancelled) setLoading(false);
         return;
       }
@@ -118,16 +120,22 @@ export default function StudentsPage() {
         return;
       }
       setUserId(authData.user.id);
+      const rangeStart = addDays(new Date(), -90);
+      const rangeEnd = addDays(new Date(), 91);
+      const range = { start: rangeStart, end: rangeEnd };
+      const eventsPromise = database.listEvents(range);
       const { data, error: studentError } = await database.listStudents();
+      if (cancelled) return;
       if (studentError) {
         setError(studentError.message);
+        setLoading(false);
+        setSummariesLoading(false);
       } else {
         const loadedStudents = (data ?? []).map((row) => studentFromRow(row, authData.user.id));
         setStudents(loadedStudents);
-        const rangeStart = addDays(new Date(), -90);
-        const rangeEnd = addDays(new Date(), 91);
-        const range = { start: rangeStart, end: rangeEnd };
-        const { data: eventData, error: eventError } = await database.listEvents(range);
+        setLoading(false);
+        const { data: eventData, error: eventError } = await eventsPromise;
+        if (cancelled) return;
         if (eventError && !cancelled) setError(eventError.message);
         const eventRows = eventError ? [] : (eventData ?? []);
         const eventIds = eventRows.map((row) => String(row.id));
@@ -135,9 +143,9 @@ export default function StudentsPage() {
         if (exceptionResult.error && !cancelled) setError(exceptionResult.error.message);
         const canonicalOccurrences = expandEvents(eventRows.map((row) => eventFromRow(row, authData.user.id)), (exceptionResult.data ?? []).map((row) => exceptionFromRow(row)), range)
           .map((occurrence) => ({ id: occurrence.id, studentId: occurrence.studentId, startsAt: occurrence.startsAt, status: occurrence.status }));
-        setSummaries(summarizeOccurrences(loadedStudents, canonicalOccurrences));
+        if (!cancelled) setSummaries(summarizeOccurrences(loadedStudents, canonicalOccurrences));
+        if (!cancelled) setSummariesLoading(false);
       }
-      if (!cancelled) setLoading(false);
     };
     void load();
     return () => { cancelled = true; };
@@ -219,7 +227,7 @@ export default function StudentsPage() {
         {notice && <div className="data-success" role="status">{notice}</div>}
         {error && <div className="data-error" role="alert">{error}</div>}
         <section className="workspace-toolbar panel"><label className="workspace-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search students" aria-label="Search students" /></label><div className="view-toggle"><button className={filter === "active" ? "view-active" : ""} onClick={() => setFilter("active")}>Active</button><button className={filter === "archived" ? "view-active" : ""} onClick={() => setFilter("archived")}>Archived</button><button className={filter === "all" ? "view-active" : ""} onClick={() => setFilter("all")}>All</button></div></section>
-        {loading ? <div className="calendar-empty">Loading students...</div> : filteredStudents.length ? <section className="student-grid">{filteredStudents.map((student) => { const summary = summaries[student.id] ?? { upcomingCount: 0, nextLesson: null, recentLesson: null, recentCount: 0 }; return <article className="student-card panel" key={student.id}><div className="student-card-heading"><div className="student-avatar">{student.name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</div><div><h2>{student.name}</h2><span className={`status-pill status-${student.status}`}>{student.status}</span></div></div><div className="student-contact">{student.email && <span>{student.email}</span>}{student.phone && <span>{student.phone}</span>}{!student.email && !student.phone && <span>No contact details yet</span>}</div><div className="student-summary"><div><span>Upcoming</span><strong>{summary.upcomingCount}</strong></div><div><span>Next lesson</span><strong>{formatLessonDate(summary.nextLesson)}</strong></div><div><span>Recent</span><strong>{summary.recentCount} · {formatLessonDate(summary.recentLesson)}</strong></div></div>{student.notes && <p className="student-notes">{student.notes}</p>}<div className="student-card-footer"><button className="secondary-button" onClick={() => openEdit(student)}><Pencil size={14} /> Edit</button><button className="text-button" onClick={() => router.push(`/calendar?student=${encodeURIComponent(student.id)}`)}><CalendarDays size={14} /> Calendar</button><button className="text-button" onClick={() => void toggleArchive(student)} disabled={saving}><Archive size={14} /> {student.status === "active" ? "Archive" : "Restore"}</button></div></article>; })}</section> : <section className="empty-workspace panel"><div className="empty-workspace-icon"><CalendarDays size={20} /></div><h2>{query ? "No students found" : "Your student list is empty"}</h2><p>{query ? "Try a different search." : "Add your first student to keep lesson planning connected to the people you teach."}</p>{!query && <button className="primary-button" onClick={openNew}><Plus size={16} /> Add student</button>}</section>}
+        {loading ? <div className="calendar-empty">Loading students...</div> : filteredStudents.length ? <section className="student-grid">{filteredStudents.map((student) => { const summary = summaries[student.id] ?? { upcomingCount: 0, nextLesson: null, recentLesson: null, recentCount: 0 }; return <article className="student-card panel" key={student.id}><div className="student-card-heading"><div className="student-avatar">{student.name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</div><div><h2>{student.name}</h2><span className={`status-pill status-${student.status}`}>{student.status}</span></div></div><div className="student-contact">{student.email && <span>{student.email}</span>}{student.phone && <span>{student.phone}</span>}{!student.email && !student.phone && <span>No contact details yet</span>}</div><div className="student-summary"><div><span>Upcoming</span><strong>{summariesLoading ? "..." : summary.upcomingCount}</strong></div><div><span>Next lesson</span><strong>{summariesLoading ? "Loading..." : formatLessonDate(summary.nextLesson)}</strong></div><div><span>Recent</span><strong>{summariesLoading ? "..." : summary.recentCount} · {summariesLoading ? "" : formatLessonDate(summary.recentLesson)}</strong></div></div>{student.notes && <p className="student-notes">{student.notes}</p>}<div className="student-card-footer"><button className="secondary-button" onClick={() => openEdit(student)}><Pencil size={14} /> Edit</button><button className="text-button" onClick={() => router.push(`/calendar?student=${encodeURIComponent(student.id)}`)}><CalendarDays size={14} /> Calendar</button><button className="text-button" onClick={() => void toggleArchive(student)} disabled={saving}><Archive size={14} /> {student.status === "active" ? "Archive" : "Restore"}</button></div></article>; })}</section> : <section className="empty-workspace panel"><div className="empty-workspace-icon"><CalendarDays size={20} /></div><h2>{query ? "No students found" : "Your student list is empty"}</h2><p>{query ? "Try a different search." : "Add your first student to keep lesson planning connected to the people you teach."}</p>{!query && <button className="primary-button" onClick={openNew}><Plus size={16} /> Add student</button>}</section>}
       </div>
       {formOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !saving) setFormOpen(false); }}><section className="lesson-modal" role="dialog" aria-modal="true" aria-labelledby="student-modal-title"><div className="modal-heading"><div><p className="section-kicker">Student record</p><h2 id="student-modal-title">{editingStudent ? "Edit student" : "Add student"}</h2></div><button className="modal-close" aria-label="Close student form" onClick={() => setFormOpen(false)}><X size={18} /></button></div><form onSubmit={saveStudent}><div className="form-grid"><label className="form-field form-field-wide"><span>Name</span><input autoFocus value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="e.g. Alex Wong" /></label><label className="form-field"><span>Email</span><input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="alex@example.com" /></label><label className="form-field"><span>Phone</span><input value={form.phone} onChange={(event) => setForm({ ...form, phone: event.target.value })} placeholder="Optional" /></label><label className="form-field form-field-wide"><span>Notes</span><textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="Learning goals, preferences, or context" rows={4} /></label></div>{error && <p className="form-error">{error}</p>}<div className="modal-footer"><span /><button type="button" className="secondary-button" onClick={() => setFormOpen(false)}>Cancel</button><button type="submit" className="primary-button" disabled={saving}>{saving ? "Saving..." : "Save student"}</button></div></form></section></div>}
     </main>

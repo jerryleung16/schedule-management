@@ -410,20 +410,27 @@ export default function Home() {
 
       setUserId(userData.user.id);
       setUserEmail(userData.user.email ?? "");
-      const { data: profileData, error: profileError } = await database.getProfile();
+      const selectedMonth = new Date(`${selectedDate}T12:00:00`);
+      const monthStart = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), 1, 0);
+      const monthEnd = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() + 1, 1, 0);
+      const monthRange = { start: monthStart, end: monthEnd };
+      const weekRange = rangeForView(dateFromKey(availabilityWeekDate), "week");
+      const [profileResult, studentResult, canonicalMonth, canonicalWeek, dailyResult] = await Promise.all([
+        database.getProfile(),
+        database.listStudents(true),
+        database.listEvents(monthRange),
+        database.listEvents(weekRange),
+        database.listDailyEvents(new Date(`${selectedDate}T00:00:00`).toISOString(), new Date(`${selectedDate}T23:59:59`).toISOString()),
+      ]);
+      const { data: profileData, error: profileError } = profileResult;
       if (profileError) setDataError(profileError.message);
       if (profileData?.display_name) setDisplayName(profileData.display_name);
       if (profileData?.default_lesson_rate !== null && profileData?.default_lesson_rate !== undefined) setDefaultLessonRate(Number(profileData.default_lesson_rate));
       if (profileData?.default_travel_minutes !== null && profileData?.default_travel_minutes !== undefined) setDefaultTravelMinutes(Number(profileData.default_travel_minutes));
       if (profileData?.default_lesson_tone) setDefaultLessonTone(profileData.default_lesson_tone as EventTone);
-      const { data: studentData, error: studentError } = await database.listStudents(true);
+      const { data: studentData, error: studentError } = studentResult;
       if (studentError) setDataError(studentError.message);
       if (studentData) setStudents(studentData.map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" : "active" })));
-      const selectedMonth = new Date(`${selectedDate}T12:00:00`);
-      const monthStart = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), 1, 0);
-      const monthEnd = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() + 1, 1, 0);
-      const monthRange = { start: monthStart, end: monthEnd };
-      const canonicalMonth = await database.listEvents(monthRange);
       if (!canonicalMonth.error) {
         const canonicalRows = canonicalMonth.data ?? [];
         const monthRows = canonicalRows;
@@ -442,8 +449,6 @@ export default function Home() {
         setMonthlyCompletedCount(0);
         setMonthlyCompletedEarnings(0);
       }
-      const weekRange = rangeForView(dateFromKey(availabilityWeekDate), "week");
-      const canonicalWeek = await database.listEvents(weekRange);
       const weekData = canonicalWeek.data;
       const weekError = canonicalWeek.error;
       if (weekError) setDataError(weekError.message);
@@ -461,7 +466,7 @@ export default function Home() {
         setWeeklyOccurrences(expanded);
         setWeeklyLessonHours(lessonHours(expanded));
       }
-      const { data, error } = await database.listDailyEvents(new Date(`${selectedDate}T00:00:00`).toISOString(), new Date(`${selectedDate}T23:59:59`).toISOString());
+      const { data, error } = dailyResult;
 
       if (error) {
         setDataError(error.message);
@@ -522,15 +527,21 @@ export default function Home() {
         loadLocalOverrides();
         loadLocalWorkingPlaces();
       } else {
-        const { data, error } = await database.listAvailability();
+        const monthRange = rangeForView(dateFromKey(availabilityWeekDate), "month");
+        const [availabilityResult, overrideResult, workingPlaceResult] = await Promise.all([
+          database.listAvailability(),
+          database.listAvailabilityOverrides(dateKey(monthRange.start), dateKey(monthRange.end)),
+          database.listWorkingPlaces(),
+        ]);
+        if (cancelled) return;
+        const { data, error } = availabilityResult;
         if (error) {
           loadLocalDefault();
           if (!cancelled) setAvailabilityError("Cloud availability is not ready yet; local availability is being used.");
         } else {
           loadedDefault = (data ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), starts: String(row.starts).slice(0, 5), ends: String(row.ends).slice(0, 5) }));
         }
-        const monthRange = rangeForView(dateFromKey(availabilityWeekDate), "month");
-        const { data: overrideData, error: overrideError } = await database.listAvailabilityOverrides(dateKey(monthRange.start), dateKey(monthRange.end));
+        const { data: overrideData, error: overrideError } = overrideResult;
         if (overrideError) {
           loadLocalOverrides();
           if (!cancelled) setAvailabilityError("Week-specific availability is not ready yet; local week values are being used.");
@@ -540,7 +551,7 @@ export default function Home() {
             return parsed ? [[parsed.weekStart, { id: String(row.id), ...parsed }]] : [];
           }));
         }
-        const { data: workingPlaceData, error: workingPlaceError } = await database.listWorkingPlaces();
+        const { data: workingPlaceData, error: workingPlaceError } = workingPlaceResult;
         if (workingPlaceError) {
           loadLocalWorkingPlaces();
           if (!cancelled) setAvailabilityError("Cloud availability or workplaces are not ready yet; local values are being used.");
