@@ -1,9 +1,10 @@
 "use client";
 
-import { FormEvent, useEffect, useState, useSyncExternalStore } from "react";
+import { FormEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { CalendarDays, ChevronLeft, ChevronRight, Clock3, Plus, Sparkles, X } from "lucide-react";
 import { database, cloudConfigured } from "@/lib/data/client";
+import { getFirebase } from "@/lib/firebase/client";
 import { deleteGoogleCalendarEvent, syncGoogleCalendarEvent, syncGoogleCalendarOccurrence } from "@/lib/google-calendar/client";
 import { slotConflicts } from "@/lib/schedule/availability";
 import { addDays, dateKey, dateFromKey, formatRangeLabel, rangeForView } from "@/lib/schedule/dates";
@@ -161,6 +162,7 @@ export default function CalendarPage() {
   const activeAnchorKey = anchorDate.getTime() === dateFromKey(initialDateKey).getTime() ? todayKey : dateKey(anchorDate);
   const activeAnchorDate = dateFromKey(activeAnchorKey);
   const [loading, setLoading] = useState(true);
+  const metadataLoaded = useRef(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [editorOpen, setEditorOpen] = useState(false);
@@ -247,54 +249,57 @@ export default function CalendarPage() {
           }
           return;
         }
-      const { data: authData, error: authError } = await database.auth.getUser();
-      if (cancelled) return;
-      if (authError || !authData.user) {
+      const user = getFirebase().auth.currentUser;
+      if (!user) {
         router.push("/login");
         return;
       }
-      setUserId(authData.user.id);
-      const [profileResult, studentResult, workingPlaceResult, eventResult] = await Promise.all([
-        database.getProfile(),
-        database.listStudents(),
-        database.listWorkingPlaces(),
-        database.listEvents({ start: new Date(rangeStartMs), end: new Date(rangeEndMs) }),
-      ]);
-      if (cancelled) return;
-      const { data: profile, error: profileError } = profileResult;
-      if (profileError && !cancelled) setError(profileError.message);
-      if (!cancelled && profile) {
-        if (profile.timezone) setProfileTimezone(profile.timezone);
-        if (profile.default_lesson_rate !== null && profile.default_lesson_rate !== undefined) setDefaultLessonRate(Number(profile.default_lesson_rate));
-        if (profile.default_travel_minutes !== null && profile.default_travel_minutes !== undefined) setDefaultTravelMinutes(Number(profile.default_travel_minutes));
-        if (profile.default_lesson_tone) setDefaultLessonTone(profile.default_lesson_tone as EventTone);
-        if (profile.default_personal_tone) setDefaultPersonalTone(profile.default_personal_tone as EventTone);
-      }
-      const { data: studentData, error: studentError } = studentResult;
-      if (studentError && !cancelled) setError(studentError.message);
-      if (!cancelled) {
-        const directory = (studentData ?? []).map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" as const : "active" as const }));
-        setStudentDirectory(directory);
-        setStudents(directory.filter((student) => student.status === "active"));
-      }
-      const { data: workingPlaceData, error: workingPlaceError } = workingPlaceResult;
-      if (!cancelled) {
-        if (workingPlaceError) {
-          const storedWorkingPlaces = window.localStorage.getItem(workingPlaceStorageKey);
-          if (storedWorkingPlaces) {
-            try {
-              const parsed = JSON.parse(storedWorkingPlaces) as Record<string, unknown>;
-              const places = Object.entries(parsed).map(([weekday, place]) => ({ weekday: Number(weekday), place: String(place ?? "") }));
-              setWorkingPlaces(workingPlacesToMap(normalizeWeeklyWorkingPlaces(places)));
-            } catch { window.localStorage.removeItem(workingPlaceStorageKey); }
-          }
-        } else {
-          const places = (workingPlaceData ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), place: String(row.place ?? "") } satisfies WeeklyWorkingPlace));
-          setWorkingPlaces(workingPlacesToMap(normalizeWeeklyWorkingPlaces(places)));
+      setUserId(user.uid);
+      const eventResult = database.listEvents({ start: new Date(rangeStartMs), end: new Date(rangeEndMs) });
+      if (!metadataLoaded.current) {
+        const [profileResult, studentResult, workingPlaceResult] = await Promise.all([
+          database.getProfile(),
+          database.listStudents(),
+          database.listWorkingPlaces(),
+        ]);
+        if (cancelled) return;
+        const { data: profile, error: profileError } = profileResult;
+        if (profileError && !cancelled) setError(profileError.message);
+        if (!cancelled && profile) {
+          if (profile.timezone) setProfileTimezone(profile.timezone);
+          if (profile.default_lesson_rate !== null && profile.default_lesson_rate !== undefined) setDefaultLessonRate(Number(profile.default_lesson_rate));
+          if (profile.default_travel_minutes !== null && profile.default_travel_minutes !== undefined) setDefaultTravelMinutes(Number(profile.default_travel_minutes));
+          if (profile.default_lesson_tone) setDefaultLessonTone(profile.default_lesson_tone as EventTone);
+          if (profile.default_personal_tone) setDefaultPersonalTone(profile.default_personal_tone as EventTone);
         }
+        const { data: studentData, error: studentError } = studentResult;
+        if (studentError && !cancelled) setError(studentError.message);
+        if (!cancelled) {
+          const directory = (studentData ?? []).map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" as const : "active" as const }));
+          setStudentDirectory(directory);
+          setStudents(directory.filter((student) => student.status === "active"));
+        }
+        const { data: workingPlaceData, error: workingPlaceError } = workingPlaceResult;
+        if (!cancelled) {
+          if (workingPlaceError) {
+            const storedWorkingPlaces = window.localStorage.getItem(workingPlaceStorageKey);
+            if (storedWorkingPlaces) {
+              try {
+                const parsed = JSON.parse(storedWorkingPlaces) as Record<string, unknown>;
+                const places = Object.entries(parsed).map(([weekday, place]) => ({ weekday: Number(weekday), place: String(place ?? "") }));
+                setWorkingPlaces(workingPlacesToMap(normalizeWeeklyWorkingPlaces(places)));
+              } catch { window.localStorage.removeItem(workingPlaceStorageKey); }
+            }
+          } else {
+            const places = (workingPlaceData ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), place: String(row.place ?? "") } satisfies WeeklyWorkingPlace));
+            setWorkingPlaces(workingPlacesToMap(normalizeWeeklyWorkingPlaces(places)));
+          }
+        }
+        metadataLoaded.current = true;
       }
 
-      const { data, error: eventError } = eventResult;
+      const { data, error: eventError } = await eventResult;
+      if (cancelled) return;
 
       const canonicalRows = eventError ? [] : (data ?? []);
       if (!cancelled) {
@@ -303,7 +308,7 @@ export default function CalendarPage() {
           setEvents([]);
           setExceptions([]);
         } else {
-          const canonicalEvents = canonicalRows.map((row) => eventFromRow(row, authData.user.id));
+          const canonicalEvents = canonicalRows.map((row) => eventFromRow(row, user.uid));
           setEvents(canonicalEvents);
 
           if (canonicalRows.length) {
