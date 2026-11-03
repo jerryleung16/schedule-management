@@ -2,10 +2,17 @@ import { signInWithEmailAndPassword, signOut } from "firebase/auth";
 import { collection, deleteDoc, doc, getDocFromServer, getDocsFromServer, limit, orderBy, query, runTransaction, startAfter, where, writeBatch, type Query, type QueryConstraint } from "firebase/firestore";
 import { getFirebase } from "../firebase/client";
 import { exceptionId, normalizeRecord, safeId, type CollectionName, type Row, type TableRows } from "./schema";
+import { eventInput, exceptionInput } from "../schedule/mutations";
+import type { ScheduleEvent, ScheduleEventException } from "../schedule/types";
 export { cloudConfigured } from "../firebase/client";
 
 type Result<Value> = { data: Value; error: null } | { data: null; error: Error };
 type DateRange = { start: Date; end: Date };
+function sameRecord(left: Record<string, unknown> | undefined, right: Record<string, unknown> | undefined) {
+  if (!left || !right) return left === right;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length && keys.every(key => JSON.stringify(left[key]) === JSON.stringify(right[key]));
+}
 async function result<Value>(operation: () => Promise<Value>): Promise<Result<Value>> {
   try { return { data: await operation(), error: null }; }
   catch (error) { return { data: null, error: error instanceof Error ? error : new Error(String(error)) }; }
@@ -37,9 +44,13 @@ async function save<Collection extends CollectionName>(name: Collection, input: 
   const reference = name === "profiles" ? doc(store, "users", uid) : doc(store, "users", uid, name, id);
   return runTransaction(store, async transaction => {
     const existing = await transaction.get(reference);
+    const parentReference = name === "eventExceptions" ? doc(store, "users", uid, "events", safeId(input.event_id)) : null;
+    const parent = parentReference ? await transaction.get(parentReference) : null;
     if (requireExisting && !existing.exists()) throw new Error("The record no longer exists. Reload before editing.");
+    if (parent && !parent.exists()) throw new Error("The recurring event no longer exists. Reload before editing.");
     const record = normalizeRecord(name, { ...existing.data(), ...input, id, updated_at: new Date().toISOString() }, uid);
     transaction.set(reference, record);
+    if (parentReference && parent) transaction.set(parentReference, { ...parent.data(), updated_at: record.updated_at });
     return record;
   });
 }
@@ -98,15 +109,46 @@ export const database = {
   listDailyEvents: (start: string, end: string) => result(() => list("events", [where("starts_at", ">=", start), where("starts_at", "<", end), orderBy("starts_at")])),
   saveEvent: (input: Record<string, unknown>) => result(() => save("events", input)),
   updateEvent: (id: string, input: Record<string, unknown>) => result(() => save("events", { ...input, id }, true)),
-  deleteEvent: (id: string) => result(async () => {
-    await remove("events", id);
+  updateEventSeries: (base: ScheduleEvent, input: Record<string, unknown>, previous: ScheduleEventException[], next: ScheduleEventException[]) => result(async () => {
     const { store, uid } = await context();
+    const reference = doc(store, "users", uid, "events", safeId(base.id));
+    const initial = await getDocFromServer(reference);
+    if (!initial.exists()) throw new Error("The event no longer exists. Reload before editing.");
+    const expectedEvent = eventInput(base);
+    if (Object.entries(expectedEvent).some(([key, value]) => JSON.stringify(initial.data()[key]) !== JSON.stringify(value))) throw new Error("This event changed on another device. Reload before editing.");
+    const current = await list("eventExceptions", [where("event_id", "==", base.id)]);
+    const expected = new Map(previous.map(exception => [exception.id, exceptionInput(exception)]));
+    if (current.length !== expected.size || current.some(row => !expected.has(row.id) || Object.entries(expected.get(row.id)!).some(([key, value]) => JSON.stringify(row[key]) !== JSON.stringify(value)))) throw new Error("The recurring occurrences changed. Reload before editing.");
+    const now = new Date().toISOString();
+    const event = normalizeRecord("events", { ...initial.data(), ...input, id: base.id, updated_at: now }, uid);
+    const exceptions = next.map(exception => normalizeRecord("eventExceptions", { ...exceptionInput(exception), updated_at: now }, uid));
+    if (exceptions.some(exception => exception.event_id !== base.id)) throw new Error("An occurrence belongs to another event.");
+    const nextIds = new Set(exceptions.map(exception => exception.id));
+    const removed = current.filter(row => !nextIds.has(row.id));
+    if (1 + exceptions.length + removed.length > 500) throw new Error("This series has too many occurrence changes to update in one operation. Your schedule has not changed.");
+    return runTransaction(store, async transaction => {
+      const saved = await transaction.get(reference);
+      const snapshots = await Promise.all(current.map(row => transaction.get(doc(store, "users", uid, "eventExceptions", row.id))));
+      if (!saved.exists() || !sameRecord(saved.data(), initial.data()) || snapshots.some((snapshot, index) => !snapshot.exists() || !sameRecord(snapshot.data(), current[index]))) throw new Error("The recurring series changed while saving. Reload and try again.");
+      transaction.set(reference, event);
+      removed.forEach(row => transaction.delete(doc(store, "users", uid, "eventExceptions", row.id)));
+      exceptions.forEach(exception => transaction.set(doc(store, "users", uid, "eventExceptions", exception.id), exception));
+      return { event, exceptions };
+    });
+  }),
+  deleteEvent: (id: string) => result(async () => {
+    const { store, uid } = await context();
+    const reference = doc(store, "users", uid, "events", safeId(id));
+    const initial = await getDocFromServer(reference);
     const exceptions = await list("eventExceptions", [where("event_id", "==", id)]);
-    for (let offset = 0; offset < exceptions.length; offset += 400) {
-      const batch = writeBatch(store);
-      exceptions.slice(offset, offset + 400).forEach(exception => batch.delete(doc(store, "users", uid, "eventExceptions", exception.id)));
-      await batch.commit();
-    }
+    if (exceptions.length > 499) throw new Error("This series has too many occurrence changes to delete in one operation. Your schedule has not changed.");
+    await runTransaction(store, async transaction => {
+      const saved = await transaction.get(reference);
+      const snapshots = await Promise.all(exceptions.map(row => transaction.get(doc(store, "users", uid, "eventExceptions", row.id))));
+      if (!sameRecord(saved.data(), initial.data()) || snapshots.some((snapshot, index) => !sameRecord(snapshot.data(), exceptions[index]))) throw new Error("The event changed while deleting. Reload and try again.");
+      transaction.delete(reference);
+      exceptions.forEach(exception => transaction.delete(doc(store, "users", uid, "eventExceptions", exception.id)));
+    });
     return { id };
   }),
   listExceptions: (eventIds: string[]) => result(async () => {

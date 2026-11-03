@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { ArrowLeft, CalendarDays, Check, Clock3, Link2, Save, Sparkles, Unlink2, UserRound } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { database, cloudConfigured } from "@/lib/data/client";
-import { disconnectGoogleCalendar, googleCalendarConfigured } from "@/lib/google-calendar/client";
+import { disconnectGoogleCalendar, googleCalendarConfigured, googleCalendarIsConnected, googleCalendarNeedsReconnect } from "@/lib/google-calendar/client";
 import { useGoogleCalendarConnection } from "@/components/google-calendar-connection";
 import type { EventTone, SchedulePreferences } from "@/lib/schedule/types";
 
@@ -41,10 +41,13 @@ export default function SettingsPage() {
   const [form, setForm] = useState<SchedulePreferences>(defaultPreferences);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [profileReady, setProfileReady] = useState(!cloudConfigured);
+  const [profileVersion, setProfileVersion] = useState(0);
   const googleCalendar = useGoogleCalendarConnection();
   const [googleDisconnecting, setGoogleDisconnecting] = useState(false);
   const googleConnected = googleCalendar.status === "connected";
   const googleBusy = Boolean(googleCalendar.busy) || googleCalendar.status === "checking" || googleDisconnecting;
+  const googleRemembered = googleCalendarIsConnected(googleCalendar.userId) || googleCalendarNeedsReconnect(googleCalendar.userId);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -52,6 +55,7 @@ export default function SettingsPage() {
     let cancelled = false;
     const load = async () => {
       setLoading(true);
+      setProfileReady(!cloudConfigured);
       setError("");
       if (!cloudConfigured) {
         const stored = window.localStorage.getItem(storageKey);
@@ -71,20 +75,18 @@ export default function SettingsPage() {
       }
       setUserId(authData.user.id);
       const { data, error: profileError } = await database.getProfile();
+      if (cancelled) return;
       if (profileError || !data) {
-        const stored = window.localStorage.getItem(storageKey);
-        if (stored) {
-          try { setForm({ ...defaultPreferences, ...(JSON.parse(stored) as Partial<SchedulePreferences>) }); } catch { window.localStorage.removeItem(storageKey); }
-        }
-        setError("Cloud preferences could not be loaded. Check your connection and Firebase access rules before saving.");
+        setError("Your saved settings could not be loaded. Retry loading before making changes.");
       } else {
         setForm(preferencesFromRow(data));
+        setProfileReady(true);
       }
       if (!cancelled) setLoading(false);
     };
     void load();
     return () => { cancelled = true; };
-  }, [router]);
+  }, [router, profileVersion]);
 
   useEffect(() => {
     if (!cloudConfigured) window.localStorage.setItem(storageKey, JSON.stringify(form));
@@ -94,14 +96,20 @@ export default function SettingsPage() {
 
   const saveSettings = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (!profileReady) {
+      setError("Load your saved settings before saving changes.");
+      return;
+    }
     if (!form.displayName.trim()) {
       setError("Add a display name first.");
       return;
     }
-    if (form.dailyStaminaLimit < 0 || form.weeklyStaminaLimit < 0 || form.defaultLessonRate < 0 || form.defaultTravelMinutes < 0) {
+    if (![form.dailyStaminaLimit, form.weeklyStaminaLimit, form.defaultLessonRate, form.defaultTravelMinutes].every((value) => Number.isFinite(value) && value >= 0)) {
       setError("Numbers cannot be negative.");
       return;
     }
+    try { new Intl.DateTimeFormat("en", { timeZone: form.timezone }); }
+    catch { setError("Enter a valid timezone, such as Asia/Hong_Kong."); return; }
     setSaving(true);
     setError("");
     const nextForm = { ...form, displayName: form.displayName.trim() };
@@ -134,7 +142,7 @@ export default function SettingsPage() {
     try {
       await disconnectGoogleCalendar();
       await googleCalendar.check();
-      setNotice("Google Calendar disconnected. Existing Google events were left untouched.");
+      setNotice("Google Calendar disconnected in this browser. Existing Google events were left untouched.");
     } catch (disconnectError) {
       setError(disconnectError instanceof Error ? disconnectError.message : "Google Calendar could not be disconnected.");
     } finally {
@@ -155,6 +163,7 @@ export default function SettingsPage() {
         <div className="calendar-intro"><div><p className="section-kicker">Make it yours</p><h1>Settings</h1><p className="calendar-subtitle">Set the defaults that make planning feel like your own rhythm.</p></div></div>
         {notice && <div className="data-success" role="status"><Check size={14} /> {notice}</div>}
         {error && <div className="data-error" role="alert">{error}</div>}
+        {!loading && !profileReady && <button type="button" className="secondary-button" onClick={() => setProfileVersion((value) => value + 1)}>Retry loading settings</button>}
         {loading ? <div className="calendar-empty">Loading settings...</div> : <form onSubmit={saveSettings} className="settings-grid">
           <section className="panel settings-card"><div className="panel-heading"><div><p className="section-kicker">Profile</p><h2>Your details</h2></div><UserRound size={20} className="panel-icon" /></div><div className="settings-card-body"><label className="form-field"><span>Display name</span><input value={form.displayName} onChange={(event) => update("displayName", event.target.value)} /></label><label className="form-field"><span>Timezone</span><input value={form.timezone} onChange={(event) => update("timezone", event.target.value)} placeholder="e.g. Asia/Hong_Kong" /></label></div></section>
           <section className="panel settings-card"><div className="panel-heading"><div><p className="section-kicker">Energy</p><h2>Workload limits</h2></div><Clock3 size={20} className="panel-icon" /></div><div className="settings-card-body settings-two-column"><label className="form-field"><span>Daily stamina limit</span><input type="number" min="0" step="0.5" value={form.dailyStaminaLimit} onChange={(event) => update("dailyStaminaLimit", Number(event.target.value))} /></label><label className="form-field"><span>Weekly stamina limit</span><input type="number" min="0" step="0.5" value={form.weeklyStaminaLimit} onChange={(event) => update("weeklyStaminaLimit", Number(event.target.value))} /></label></div></section>
@@ -172,12 +181,12 @@ export default function SettingsPage() {
               <div className="google-calendar-actions">
                 {googleConnected ? <>
                   <button type="button" className="primary-button" onClick={() => router.push("/calendar")}><CalendarDays size={15} /> Open My calendar</button>
-                  <button type="button" className="secondary-button" disabled={googleBusy} onClick={() => void disconnectGoogle()}><Unlink2 size={15} /> {googleDisconnecting ? "Disconnecting..." : "Disconnect Google Calendar"}</button>
                 </> : <button type="button" className="primary-button" disabled={googleBusy || !googleCalendarConfigured()} onClick={() => void googleCalendar.connectAndSync()}><Link2 size={15} /> {googleCalendar.busy === "connect" ? "Connecting..." : googleCalendar.busy === "sync" ? "Syncing..." : googleCalendar.status === "checking" ? "Checking..." : googleReconnectRequired ? "Reconnect Google Calendar" : "Connect Google Calendar"}</button>}
+                {googleRemembered && <button type="button" className="secondary-button" disabled={Boolean(googleCalendar.busy) || googleDisconnecting} onClick={() => void disconnectGoogle()}><Unlink2 size={15} /> {googleDisconnecting ? "Disconnecting..." : "Disconnect Google Calendar"}</button>}
               </div>
             </div>
           </section>
-          <div className="settings-actions"><span /><button type="submit" className="primary-button" disabled={saving}><Save size={15} /> {saving ? "Saving..." : "Save settings"}</button></div>
+          <div className="settings-actions"><span /><button type="submit" className="primary-button" disabled={saving || !profileReady}><Save size={15} /> {saving ? "Saving..." : "Save settings"}</button></div>
         </form>}
       </div>
     </main>

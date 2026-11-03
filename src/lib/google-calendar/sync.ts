@@ -1,7 +1,8 @@
 import { cloudConfigured, database } from "@/lib/data/client";
 import { normalizeRecord, safeId, type EventRow, type ExceptionRow } from "@/lib/data/schema";
-import type { ScheduleEvent } from "@/lib/schedule/types";
-import { googleCalendarDeletionCandidates, googleCalendarIsConnected, retryGoogleCalendarDeletions, syncGoogleCalendarEvent, syncGoogleCalendarOccurrence, type GoogleCalendarSyncResult } from "./client";
+import type { ScheduleEvent, ScheduleEventException } from "@/lib/schedule/types";
+import { isOriginalOccurrence } from "@/lib/schedule/recurrence";
+import { googleCalendarDeletionCandidates, googleCalendarIsConnected, googleCalendarRemoteDeletionCandidates, reconcileGoogleCalendarOccurrences, retryGoogleCalendarDeletions, syncGoogleCalendarEvent, syncGoogleCalendarOccurrence, type GoogleCalendarSyncResult } from "./client";
 
 function scheduleEventFromRow(row: EventRow): ScheduleEvent {
   return {
@@ -73,15 +74,7 @@ function requireSynced(result: GoogleCalendarSyncResult) {
   if (result !== "synced") throw new Error("Google Calendar is not connected. Reconnect it and try syncing again.");
 }
 
-function dateInTimezone(timestamp: string, timezone: string) {
-  const parts = new Intl.DateTimeFormat("en", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(timestamp));
-  return ["year", "month", "day"].map((type) => parts.find((part) => part.type === type)?.value).join("-");
-}
-
-export async function syncSavedScheduleToGoogleCalendar(userId: string): Promise<{ events: number; occurrences: number; deleted: number }> {
-  safeId(userId);
-  if (!googleCalendarIsConnected(userId)) throw new Error("Connect or reconnect Google Calendar from My calendar, then try syncing again.");
-  const deletionCandidates = googleCalendarDeletionCandidates(userId);
+async function loadSavedSchedule(userId: string) {
   let events: ScheduleEvent[];
   let exceptions: ExceptionRow[] = [];
   if (cloudConfigured) {
@@ -99,34 +92,89 @@ export async function syncSavedScheduleToGoogleCalendar(userId: string): Promise
 
   const eventsById = new Map(events.map((event) => [event.id, event]));
   if (eventsById.size !== events.length) throw new Error("The saved schedule contains duplicate event IDs. Resolve them before syncing.");
+  const changes: ScheduleEventException[] = exceptions.map((row) => ({
+    id: row.id,
+    eventId: row.event_id,
+    originalStartsAt: row.original_starts_at,
+    startsAt: row.starts_at,
+    endsAt: row.ends_at,
+    title: row.title,
+    detail: row.detail,
+    kind: row.kind,
+    tone: row.tone,
+    travelMinutes: row.travel_minutes,
+    hourlyRate: row.hourly_rate,
+    fixedFee: row.fixed_fee,
+    status: row.status,
+  }));
+  const fingerprint = JSON.stringify({
+    events: [...events].sort((left, right) => left.id.localeCompare(right.id)),
+    exceptions: [...changes].sort((left, right) => left.id.localeCompare(right.id)),
+  });
+  return { events, changes, fingerprint };
+}
 
-  // Load and validate the complete schedule before changing Google Calendar.
-  for (const event of events) requireSynced(await syncGoogleCalendarEvent(event));
+type SyncSummary = { events: number; occurrences: number; deleted: number };
+const runningSyncs = new Map<string, Promise<SyncSummary>>();
+class ScheduleChangedDuringSync extends Error {}
+const scheduleVersion = () => window.localStorage.getItem("daylight-schedule-version");
 
-  let occurrences = 0;
-  for (const row of exceptions) {
-    const event = eventsById.get(row.event_id);
-    if (!event?.recurrenceWeekdays.length || event.status === "cancelled" || event.status === "skipped") continue;
-    if (new Date(row.original_starts_at).getTime() < new Date(event.startsAt).getTime()) continue;
-    const originalDate = dateInTimezone(row.original_starts_at, event.timezone);
-    if (event.recurrenceUntil && originalDate > event.recurrenceUntil) continue;
-    if (!event.recurrenceWeekdays.includes(new Date(`${originalDate}T00:00:00Z`).getUTCDay())) continue;
-    const originalEnd = new Date(new Date(row.original_starts_at).getTime() + new Date(event.endsAt).getTime() - new Date(event.startsAt).getTime()).toISOString();
-    requireSynced(await syncGoogleCalendarOccurrence(event, row.original_starts_at, {
-      startsAt: row.starts_at ?? row.original_starts_at,
-      endsAt: row.ends_at ?? originalEnd,
-      title: row.title,
-      detail: row.detail,
-      kind: row.kind,
-      tone: row.tone,
-      travelMinutes: row.travel_minutes,
-      hourlyRate: row.hourly_rate,
-      fixedFee: row.fixed_fee,
-      status: row.status,
-    }));
-    occurrences += 1;
+async function replaySavedSchedule(userId: string): Promise<SyncSummary> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const version = scheduleVersion();
+    const deletionCandidates = [...new Set([...googleCalendarDeletionCandidates(userId), ...await googleCalendarRemoteDeletionCandidates(userId)])];
+    const snapshot = await loadSavedSchedule(userId);
+    const assertCurrent = () => {
+      if (version !== scheduleVersion()) throw new ScheduleChangedDuringSync();
+    };
+    const verifySnapshot = async () => {
+      assertCurrent();
+      const latest = await loadSavedSchedule(userId);
+      assertCurrent();
+      if (latest.fingerprint !== snapshot.fingerprint) throw new ScheduleChangedDuringSync();
+    };
+    try {
+      assertCurrent();
+      for (const event of snapshot.events) {
+        assertCurrent();
+        requireSynced(await syncGoogleCalendarEvent(event));
+        assertCurrent();
+      }
+      let occurrences = 0;
+      for (const event of snapshot.events) {
+        if (!event.recurrenceWeekdays.length || event.status === "cancelled" || event.status === "skipped") continue;
+        const changes = snapshot.changes.filter((change) => change.eventId === event.id && isOriginalOccurrence(event, change.originalStartsAt));
+        assertCurrent();
+        await reconcileGoogleCalendarOccurrences(event, changes);
+        assertCurrent();
+        for (const change of changes) {
+          assertCurrent();
+          requireSynced(await syncGoogleCalendarOccurrence(event, change.originalStartsAt, change));
+          assertCurrent();
+          occurrences += 1;
+        }
+      }
+      // Validate the complete current data before removing linked events, and again before success.
+      // A slow replay must never finish by reviving an event deleted during that replay.
+      await verifySnapshot();
+      const deleted = await retryGoogleCalendarDeletions(userId, snapshot.events.map((event) => event.id), deletionCandidates);
+      await verifySnapshot();
+      return { events: snapshot.events.length, occurrences, deleted };
+    } catch (error) {
+      if (!(error instanceof ScheduleChangedDuringSync)) throw error;
+    }
   }
+  throw new Error("Your schedule changed during synchronization. Your changes are saved; sync again to send the latest schedule.");
+}
 
-  const deleted = await retryGoogleCalendarDeletions(userId, [...eventsById.keys()], deletionCandidates);
-  return { events: events.length, occurrences, deleted };
+export function syncSavedScheduleToGoogleCalendar(userId: string): Promise<SyncSummary> {
+  safeId(userId);
+  if (!googleCalendarIsConnected(userId)) return Promise.reject(new Error("Connect or reconnect Google Calendar from My calendar, then try syncing again."));
+  const current = runningSyncs.get(userId);
+  if (current) return current;
+  const operation = replaySavedSchedule(userId).finally(() => {
+    if (runningSyncs.get(userId) === operation) runningSyncs.delete(userId);
+  });
+  runningSyncs.set(userId, operation);
+  return operation;
 }

@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "node --test scripts/*.test.mjs",
     "migration": "node --env-file-if-exists=.env.migration scripts/migrate-firebase.mjs"
   },
   "dependencies": {

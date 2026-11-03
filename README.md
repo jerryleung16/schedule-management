@@ -55,12 +55,16 @@ Open **My calendar** and use **Sync to Google Calendar** to resend the complete 
 
 After each workspace login, Daylight verifies Google Calendar access and syncs the saved schedule when authorization is valid. It checks again when the browser regains focus, the network returns, or the token expires. Google requires a user gesture to renew expired authorization, so Daylight shows a Connect/Reconnect button when needed; it never treats an expired token or failed network request as a verified connection. Authorization is scoped to the signed-in workspace account.
 
+My calendar opens in Day view on phones, with a daily agenda, touch-friendly controls, and a compact month grid. Recurring events appear in Overview; edit or delete them through My calendar to choose one occurrence, following occurrences, or the series. Editing a series retains its original start and preserves applicable skips and reschedules. Series changes and exception migration save together.
+
+Full sync verifies that the saved schedule has not changed before reporting success and restarts when edits occur during replay. Google event IDs are stable to prevent simultaneous requests from creating duplicates. Daylight-owned events carry a workspace marker so missed deletions can be recovered on another browser; older unmarked events use browser links until they have been synced again.
+
 ## Validate
 
 ```bash
 npm run lint
 npm run build
-node --test scripts/google-calendar.test.mjs
+npm test
 ```
 
 The calendar uses the profile timezone for display, expands weekly events only within the visible range, and keeps the event series separate from occurrence exceptions. Scheduled events do not count toward actual earnings; completed lesson events use hourly duration multiplied by rate, while skipped and cancelled events are excluded.

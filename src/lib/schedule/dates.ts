@@ -1,4 +1,5 @@
 import type { CalendarRange, CalendarView } from "./types";
+import { dateTimeInTimeZone } from "./timezone";
 
 export function dateKey(date: Date) {
   const year = date.getFullYear();
@@ -9,7 +10,7 @@ export function dateKey(date: Date) {
 
 export function dateFromKey(value: string) {
   const [year, month, day] = value.split("-").map(Number);
-  return new Date(year, month - 1, day, 12);
+  return new Date(year, month - 1, day);
 }
 
 export function addDays(date: Date, amount: number) {
@@ -19,29 +20,32 @@ export function addDays(date: Date, amount: number) {
 }
 
 export function startOfWeek(date: Date) {
-  return addDays(new Date(date.getFullYear(), date.getMonth(), date.getDate(), 12), -((date.getDay() + 6) % 7));
+  return addDays(new Date(date.getFullYear(), date.getMonth(), date.getDate()), -((date.getDay() + 6) % 7));
 }
 
 export function startOfMonth(date: Date) {
-  return new Date(date.getFullYear(), date.getMonth(), 1, 12);
+  return new Date(date.getFullYear(), date.getMonth(), 1);
 }
 
-export function rangeForView(date: Date, view: CalendarView): CalendarRange {
+export function rangeForView(date: Date, view: CalendarView, timeZone?: string): CalendarRange {
+  const bounds = (start: Date, end: Date): CalendarRange => timeZone
+    ? { start: dateTimeInTimeZone(dateKey(start), "00:00", timeZone), end: dateTimeInTimeZone(dateKey(end), "00:00", timeZone) }
+    : { start, end };
   if (view === "day") {
     const start = dateFromKey(dateKey(date));
-    return { start, end: addDays(start, 1) };
+    return bounds(start, addDays(start, 1));
   }
 
   if (view === "month") {
     const monthStart = startOfMonth(date);
     const gridStart = startOfWeek(monthStart);
-    const monthEnd = new Date(date.getFullYear(), date.getMonth() + 1, 0, 12);
-    const gridEnd = addDays(startOfWeek(addDays(monthEnd, 6)), 1);
-    return { start: gridStart, end: gridEnd };
+    const monthEnd = new Date(date.getFullYear(), date.getMonth() + 1, 0);
+    const gridEnd = addDays(startOfWeek(monthEnd), 7);
+    return bounds(gridStart, gridEnd);
   }
 
   const start = startOfWeek(date);
-  return { start, end: addDays(start, 7) };
+  return bounds(start, addDays(start, 7));
 }
 
 export function formatDateKey(date: Date) {

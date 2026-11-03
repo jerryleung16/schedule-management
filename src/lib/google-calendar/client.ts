@@ -1,4 +1,6 @@
-import type { EventKind, EventStatus, EventTone, ScheduleEvent } from "@/lib/schedule/types";
+import type { EventKind, EventStatus, EventTone, ScheduleEvent, ScheduleEventException } from "@/lib/schedule/types";
+import { endOfDayInTimeZone } from "@/lib/schedule/timezone";
+import { isOriginalOccurrence } from "@/lib/schedule/recurrence";
 
 const googleCalendarScope = "https://www.googleapis.com/auth/calendar.events";
 const googleCalendarScript = "https://accounts.google.com/gsi/client";
@@ -21,7 +23,8 @@ type GoogleCalendarEvent = {
   start: { dateTime: string; timeZone: string };
   end: { dateTime: string; timeZone: string };
   recurrence: string[] | null;
-  extendedProperties: { private: { daylightEventId: string } };
+  status?: string;
+  extendedProperties: { private: { daylightEventId: string; daylightUserId?: string } };
 };
 
 type GoogleCalendarEventResponse = GoogleCalendarEvent & {
@@ -39,9 +42,29 @@ let scriptPromise: Promise<void> | null = null;
 let currentToken: StoredToken | null = null;
 
 class GoogleCalendarError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly reasons: string[] = []) {
     super(message);
   }
+}
+
+function authorizationFailed(error: unknown): error is GoogleCalendarError {
+  return error instanceof GoogleCalendarError && (error.status === 401 || (error.status === 403 && error.reasons.some((reason) => ["authError", "insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"].includes(reason))));
+}
+
+function invalidateToken(userId: string | undefined, accessToken: string) {
+  let changed = false;
+  if (currentToken && currentToken.userId === userId && currentToken.accessToken === accessToken) {
+    currentToken = null;
+    changed = true;
+  }
+  try {
+    const stored = JSON.parse(window.sessionStorage.getItem(tokenStorageKey) ?? "null") as StoredToken | null;
+    if (stored?.userId === userId && stored?.accessToken === accessToken) {
+      window.sessionStorage.removeItem(tokenStorageKey);
+      changed = true;
+    }
+  } catch { }
+  if (changed) notifyConnectionChanged();
 }
 
 function eventIsMissing(error: unknown) {
@@ -176,19 +199,20 @@ async function googleFetch<T>(path: string, init: RequestInit = {}, userId = con
     signal: init.signal ?? AbortSignal.timeout(20_000),
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json", ...(init.headers ?? {}) },
   });
-  if (response.status === 401) {
-    window.sessionStorage.removeItem(tokenStorageKey);
-    currentToken = null;
-    notifyConnectionChanged();
-    throw new GoogleCalendarError("Google Calendar authorization expired. Reconnect from My calendar, then sync again.", 401);
-  }
   if (!response.ok) {
     let message = "Google Calendar could not be updated.";
+    let reasons: string[] = [];
     try {
-      const body = await response.json() as { error?: { message?: string } };
+      const body = await response.json() as { error?: { message?: string; errors?: { reason?: string }[]; details?: { reason?: string }[] } };
       message = body.error?.message ?? message;
+      reasons = [...(body.error?.errors ?? []), ...(body.error?.details ?? [])].flatMap((detail) => detail.reason ? [detail.reason] : []);
     } catch { }
-    throw new GoogleCalendarError(message, response.status);
+    const error = new GoogleCalendarError(message, response.status, reasons);
+    if (authorizationFailed(error)) {
+      invalidateToken(userId, accessToken);
+      throw new GoogleCalendarError("Google Calendar authorization expired or lacks Calendar permission. Reconnect from My calendar, then sync again.", response.status, reasons);
+    }
+    throw error;
   }
   if (response.status === 204) return null as T;
   return await response.json() as T;
@@ -237,8 +261,8 @@ function weekdayCode(weekday: number) {
   return ["SU", "MO", "TU", "WE", "TH", "FR", "SA"][weekday] ?? "MO";
 }
 
-function recurrenceUntil(value: string) {
-  const localEnd = new Date(`${value}T23:59:59`);
+function recurrenceUntil(value: string, timezone: string) {
+  const localEnd = endOfDayInTimeZone(value, timezone);
   if (Number.isNaN(localEnd.getTime())) return "";
   const utc = localEnd.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
   return `;UNTIL=${utc}`;
@@ -247,7 +271,7 @@ function recurrenceUntil(value: string) {
 function googleEventFromScheduleEvent(event: ScheduleEvent): GoogleCalendarEvent {
   const timezone = event.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const recurrence = event.recurrenceWeekdays.length > 0
-    ? [`RRULE:FREQ=WEEKLY;BYDAY=${event.recurrenceWeekdays.map(weekdayCode).join(",")}${event.recurrenceUntil ? recurrenceUntil(event.recurrenceUntil) : ""}`]
+    ? [`RRULE:FREQ=WEEKLY;BYDAY=${event.recurrenceWeekdays.map(weekdayCode).join(",")}${event.recurrenceUntil ? recurrenceUntil(event.recurrenceUntil, timezone) : ""}`]
     : null;
   return {
     summary: event.title,
@@ -255,16 +279,17 @@ function googleEventFromScheduleEvent(event: ScheduleEvent): GoogleCalendarEvent
     start: { dateTime: event.startsAt, timeZone: timezone },
     end: { dateTime: event.endsAt, timeZone: timezone },
     recurrence,
-    extendedProperties: { private: { daylightEventId: event.id } },
+    extendedProperties: { private: { daylightEventId: event.id, daylightUserId: event.userId } },
   };
 }
 
 async function findGoogleEventId(event: Pick<ScheduleEvent, "id" | "userId">) {
+  const belongsToOwner = (item: GoogleCalendarEventResponse) => !item.extendedProperties?.private?.daylightUserId || item.extendedProperties.private.daylightUserId === event.userId;
   const links = readEventLinks(event.userId);
   if (links[event.id]) {
     try {
       const existing = await googleFetch<GoogleCalendarEventResponse>(`/calendars/primary/events/${encodeURIComponent(links[event.id])}`, {}, event.userId);
-      if (existing.status !== "cancelled" && !existing.recurringEventId && !existing.originalStartTime) return links[event.id];
+      if (existing.status !== "cancelled" && !existing.recurringEventId && !existing.originalStartTime && belongsToOwner(existing)) return links[event.id];
       removeEventLink(event.userId, event.id);
     } catch (error) {
       if (!eventIsMissing(error)) throw error;
@@ -274,7 +299,7 @@ async function findGoogleEventId(event: Pick<ScheduleEvent, "id" | "userId">) {
   const params = new URLSearchParams({ privateExtendedProperty: `daylightEventId=${event.id}`, showDeleted: "false", singleEvents: "false", maxResults: "250" });
   while (true) {
     const result = await googleFetch<GoogleCalendarListResponse>(`/calendars/primary/events?${params.toString()}`, {}, event.userId);
-    const id = result.items?.find((item) => item.id && item.status !== "cancelled" && !item.recurringEventId && !item.originalStartTime)?.id;
+    const id = result.items?.find((item) => item.id && item.status !== "cancelled" && !item.recurringEventId && !item.originalStartTime && belongsToOwner(item))?.id;
     if (id) {
       writeEventLink(event.userId, event.id, id);
       return id;
@@ -318,19 +343,18 @@ export function googleCalendarTokenExpiresAt(userId: string): number | null {
 export async function checkGoogleCalendarConnection(userId: string): Promise<"connected" | "not-connected" | "reconnect-required"> {
   if (!connectionForUser(userId)) return "not-connected";
   if (!loadStoredToken(userId)) return "reconnect-required";
-  try {
-    await googleFetch("/calendars/primary/events?maxResults=1&showDeleted=false", {}, userId);
-    return googleCalendarIsConnected(userId) ? "connected" : connectionForUser(userId) ? "reconnect-required" : "not-connected";
-  } catch (error) {
-    if (error instanceof GoogleCalendarError && error.status === 401) return "reconnect-required";
-    if (error instanceof GoogleCalendarError && error.status === 403) {
-      window.sessionStorage.removeItem(tokenStorageKey);
-      currentToken = null;
-      notifyConnectionChanged();
-      return "reconnect-required";
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await googleFetch("/calendars/primary/events?maxResults=1&showDeleted=false", {}, userId);
+      return googleCalendarIsConnected(userId) ? "connected" : connectionForUser(userId) ? "reconnect-required" : "not-connected";
+    } catch (error) {
+      if (!authorizationFailed(error)) throw error;
+      // A response from an old request must not invalidate a freshly connected token.
+      if (attempt === 0 && googleCalendarIsConnected(userId)) continue;
+      return connectionForUser(userId) ? "reconnect-required" : "not-connected";
     }
-    throw error;
   }
+  return "reconnect-required";
 }
 
 export async function connectGoogleCalendar(userId: string) {
@@ -342,10 +366,16 @@ export async function connectGoogleCalendar(userId: string) {
 
 export async function disconnectGoogleCalendar() {
   const token = loadStoredToken();
-  if (token) {
-    try { await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token.accessToken)}`, { method: "POST" }); } catch { }
-  }
   clearConnection();
+  if (token) {
+    try { await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token.accessToken)}`, { method: "POST", signal: AbortSignal.timeout(10_000) }); } catch { }
+  }
+}
+
+async function stableGoogleEventId(event: Pick<ScheduleEvent, "id" | "userId">) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([event.userId, event.id])));
+  // Hex is a subset of Google's base32hex alphabet. The namespace includes the workspace owner.
+  return `d${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 export async function syncGoogleCalendarEvent(event: ScheduleEvent): Promise<GoogleCalendarSyncResult> {
@@ -358,8 +388,18 @@ export async function syncGoogleCalendarEvent(event: ScheduleEvent): Promise<Goo
   if (existingId) {
     await googleFetch(`/calendars/primary/events/${encodeURIComponent(existingId)}`, { method: "PATCH", body: JSON.stringify(resource) }, event.userId);
   } else {
-    const created = await googleFetch<GoogleCalendarEventResponse>("/calendars/primary/events", { method: "POST", body: JSON.stringify(resource) }, event.userId);
-    if (created.id) writeEventLink(event.userId, event.id, created.id);
+    const id = await stableGoogleEventId(event);
+    try {
+      const created = await googleFetch<GoogleCalendarEventResponse>("/calendars/primary/events", { method: "POST", body: JSON.stringify({ ...resource, id }) }, event.userId);
+      if (created.id) writeEventLink(event.userId, event.id, created.id);
+    } catch (error) {
+      if (!(error instanceof GoogleCalendarError) || error.status !== 409) throw error;
+      // Concurrent tabs and a lost create response converge on the same resource.
+      const existing = await googleFetch<GoogleCalendarEventResponse>(`/calendars/primary/events/${encodeURIComponent(id)}`, {}, event.userId);
+      if (existing.status !== "cancelled" && existing.extendedProperties?.private?.daylightEventId !== event.id) throw new Error("The Google Calendar event identifier belongs to another event.");
+      await googleFetch(`/calendars/primary/events/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ ...resource, status: "confirmed" }) }, event.userId);
+      writeEventLink(event.userId, event.id, id);
+    }
   }
   return "synced";
 }
@@ -384,6 +424,24 @@ export function googleCalendarDeletionCandidates(userId: string): string[] {
   return [...new Set([...readPendingDeletions(userId), ...Object.keys(readEventLinks(userId))])];
 }
 
+export async function googleCalendarRemoteDeletionCandidates(userId: string): Promise<string[]> {
+  if (!googleCalendarIsConnected(userId)) throw new Error("Reconnect Google Calendar from My calendar, then sync again.");
+  const params = new URLSearchParams({ privateExtendedProperty: `daylightUserId=${userId}`, singleEvents: "false", showDeleted: "false", maxResults: "250" });
+  const ids = new Set<string>();
+  while (true) {
+    const page = await googleFetch<GoogleCalendarListResponse>(`/calendars/primary/events?${params.toString()}`, {}, userId);
+    for (const item of page.items ?? []) {
+      const id = item.extendedProperties?.private?.daylightEventId;
+      if (!item.id || !id || item.extendedProperties?.private?.daylightUserId !== userId || item.status === "cancelled" || item.recurringEventId || item.originalStartTime) continue;
+      ids.add(id);
+      writeEventLink(userId, id, item.id);
+    }
+    if (!page.nextPageToken) break;
+    params.set("pageToken", page.nextPageToken);
+  }
+  return [...ids];
+}
+
 // Capture candidates before loading the saved schedule, so new links are never treated as deletions.
 export async function retryGoogleCalendarDeletions(userId: string, activeEventIds: string[], candidates = googleCalendarDeletionCandidates(userId)): Promise<number> {
   if (!googleCalendarIsConnected(userId)) throw new Error("Reconnect Google Calendar from My calendar, then sync again.");
@@ -397,6 +455,50 @@ export async function retryGoogleCalendarDeletions(userId: string, activeEventId
     deleted += 1;
   }
   return deleted;
+}
+
+export async function reconcileGoogleCalendarOccurrences(event: ScheduleEvent, exceptions: ScheduleEventException[]): Promise<void> {
+  if (!event.recurrenceWeekdays.length || event.status === "cancelled" || event.status === "skipped") return;
+  if (!googleCalendarIsConnected(event.userId)) throw new Error("Reconnect Google Calendar from My calendar, then sync again.");
+  const parentId = await findGoogleEventId(event);
+  if (!parentId) throw new Error("The recurring event could not be found in Google Calendar. Try syncing again.");
+  const localOrigins = new Set(exceptions.filter((exception) => exception.eventId === event.id).map((exception) => new Date(exception.originalStartsAt).toISOString()));
+  // Cancelled instances may retain only id, recurringEventId, and originalStartTime.
+  // Read finite exception records without a property filter, then restrict mutations to our parent.
+  const params = new URLSearchParams({ singleEvents: "false", showDeleted: "true", maxResults: "250" });
+  const overrides: GoogleCalendarEventResponse[] = [];
+  while (true) {
+    const page = await googleFetch<GoogleCalendarListResponse>(`/calendars/primary/events?${params.toString()}`, {}, event.userId);
+    overrides.push(...(page.items ?? []).filter((item) => item.id && item.recurringEventId === parentId && item.originalStartTime?.dateTime));
+    if (!page.nextPageToken) break;
+    params.set("pageToken", page.nextPageToken);
+  }
+  for (const instance of overrides) {
+    const original = new Date(instance.originalStartTime!.dateTime!).toISOString();
+    const applies = isOriginalOccurrence(event, original);
+    if (applies && localOrigins.has(original)) continue;
+    if (!applies) {
+      // A moved/removed series slot must not survive as an orphaned Google override.
+      if (instance.status !== "cancelled") {
+        try {
+          await googleFetch(`/calendars/primary/events/${encodeURIComponent(instance.id!)}`, { method: "DELETE" }, event.userId);
+        } catch (error) {
+          if (!eventIsMissing(error)) throw error;
+        }
+      }
+      continue;
+    }
+    const endsAt = new Date(new Date(original).getTime() + new Date(event.endsAt).getTime() - new Date(event.startsAt).getTime()).toISOString();
+    await googleFetch(`/calendars/primary/events/${encodeURIComponent(instance.id!)}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        status: "confirmed", summary: event.title, description: event.detail,
+        start: { dateTime: original, timeZone: event.timezone },
+        end: { dateTime: endsAt, timeZone: event.timezone },
+        extendedProperties: { private: { daylightEventId: event.id } },
+      }),
+    }, event.userId);
+  }
 }
 
 export async function syncGoogleCalendarOccurrence(event: ScheduleEvent, originalStartsAt: string, change: GoogleCalendarOccurrenceChange): Promise<GoogleCalendarSyncResult> {

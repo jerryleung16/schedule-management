@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { webcrypto } from "node:crypto";
 import ts from "typescript";
 
 const connectionKey = "daylight-google-calendar-connection";
@@ -27,7 +28,7 @@ function evaluate(relativePath, globals = {}, dependencies = {}) {
   });
   const evaluatedModule = { exports: {} };
   const context = {
-    module: evaluatedModule, exports: evaluatedModule.exports, URLSearchParams, Date, Intl, Event, AbortSignal,
+    module: evaluatedModule, exports: evaluatedModule.exports, URLSearchParams, Date, Intl, Event, AbortSignal, crypto: webcrypto, TextEncoder,
     process: { env: { NEXT_PUBLIC_GOOGLE_CLIENT_ID: "test-client" } },
     require: (name) => {
       assert.ok(Object.hasOwn(dependencies, name), `Unexpected import: ${name}`);
@@ -88,11 +89,14 @@ function calendarServer() {
     }
     const id = decodeURIComponent(request.url.pathname.split("/").at(-1));
     if (id === "events" && request.method === "GET") {
-      const filter = request.url.searchParams.get("privateExtendedProperty")?.replace("daylightEventId=", "");
-      return response(200, { items: [...events.values()].filter((item) => !filter || item.extendedProperties?.private?.daylightEventId === filter) });
+      const filter = request.url.searchParams.get("privateExtendedProperty");
+      const [property, value] = filter?.split("=") ?? [];
+      return response(200, { items: [...events.values()].filter((item) => !filter || item.extendedProperties?.private?.[property] === value) });
     }
     if (id === "events" && request.method === "POST") {
-      const created = { ...request.body, id: `google-${++sequence}` };
+      const requestedId = request.body.id ?? `google-${++sequence}`;
+      if (events.has(requestedId)) return response(409, { error: { message: "The requested identifier already exists.", errors: [{ reason: "duplicate" }] } });
+      const created = { ...request.body, id: requestedId };
       events.set(created.id, created);
       return response(200, created);
     }
@@ -105,7 +109,13 @@ function calendarServer() {
 }
 
 function loadClient(window, fetch, document) {
-  return evaluate("src/lib/google-calendar/client.ts", { window, fetch, document });
+  return evaluate("src/lib/google-calendar/client.ts", { window, fetch, document }, scheduleModules());
+}
+
+function scheduleModules() {
+  const timezone = evaluate("src/lib/schedule/timezone.ts");
+  const recurrence = evaluate("src/lib/schedule/recurrence.ts", {}, { "./timezone": timezone });
+  return { "@/lib/schedule/timezone": timezone, "@/lib/schedule/recurrence": recurrence };
 }
 
 test("login connection check verifies Calendar access on every check without opening Google sign-in", async () => {
@@ -145,7 +155,7 @@ for (const status of [401, 403]) {
     const window = browser();
     const linked = JSON.stringify({ "event-1": "google-1" });
     window.localStorage.setItem(linksKey, linked);
-    const client = loadClient(window, async () => response(status, { error: { message: "Calendar permission was revoked" } }));
+    const client = loadClient(window, async () => response(status, { error: { message: "Calendar permission was revoked", errors: [{ reason: status === 403 ? "insufficientPermissions" : "authError" }] } }));
     const notices = [];
     window.addEventListener(client.googleCalendarConnectionChangedEvent, (event) => notices.push(event.type));
     assert.equal(await client.checkGoogleCalendarConnection(userId), "reconnect-required");
@@ -210,6 +220,144 @@ test("connection changes notify mounted views when authorization is granted and 
   await client.disconnectGoogleCalendar();
   assert.ok(notices.length > afterConnect);
   assert.equal(await client.checkGoogleCalendarConnection(userId), "not-connected");
+});
+
+for (const reason of ["rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded", "accessNotConfigured"]) {
+  test(`Calendar 403 ${reason} preserves authorization for retry`, async () => {
+    const window = browser();
+    const client = loadClient(window, async () => response(403, { error: { message: reason, errors: [{ reason }] } }));
+    const stored = window.sessionStorage.getItem(tokenKey);
+    await assert.rejects(client.checkGoogleCalendarConnection(userId), new RegExp(reason));
+    assert.equal(window.sessionStorage.getItem(tokenKey), stored);
+    assert.equal(client.googleCalendarIsConnected(userId), true);
+  });
+}
+
+test("a permission-denied connect discards its token so the next gesture can authorize again", async () => {
+  const window = browser();
+  window.localStorage.removeItem(connectionKey);
+  window.sessionStorage.removeItem(tokenKey);
+  let popups = 0;
+  window.google.accounts.oauth2.initTokenClient = ({ callback }) => ({ requestAccessToken: () => {
+    popups += 1;
+    callback({ access_token: `new-token-${popups}`, expires_in: 3600 });
+  } });
+  const client = loadClient(window, async (_url, init) => init.headers.Authorization === "Bearer new-token-1"
+    ? response(403, { error: { message: "Insufficient scope", errors: [{ reason: "insufficientPermissions" }] } })
+    : response(200, { items: [] }));
+  await assert.rejects(client.connectGoogleCalendar(userId), /Calendar permission/i);
+  assert.equal(window.sessionStorage.getItem(tokenKey), null);
+  await client.connectGoogleCalendar(userId);
+  assert.equal(popups, 2);
+  assert.equal(client.googleCalendarIsConnected(userId), true);
+});
+
+test("a late 401 from an old token cannot erase newly renewed authorization", async () => {
+  const window = browser();
+  let releaseOld;
+  let markStarted;
+  const delayed = new Promise((resolve) => { releaseOld = resolve; });
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  let oldRequests = 0;
+  const client = loadClient(window, async (_url, init) => {
+    if (init.headers.Authorization === "Bearer test-token") {
+      oldRequests += 1;
+      if (oldRequests === 1) { markStarted(); return delayed; }
+      return response(401);
+    }
+    assert.equal(init.headers.Authorization, "Bearer renewed-token");
+    return response(200, { items: [] });
+  });
+  const firstCheck = client.checkGoogleCalendarConnection(userId);
+  await started;
+  assert.equal(await client.checkGoogleCalendarConnection(userId), "reconnect-required");
+  await client.connectGoogleCalendar(userId);
+  releaseOld(response(401));
+  assert.equal(await firstCheck, "connected");
+  assert.equal(client.googleCalendarIsConnected(userId), true);
+  assert.equal(JSON.parse(window.sessionStorage.getItem(tokenKey)).accessToken, "renewed-token");
+});
+
+test("disconnect clears immediately and a late revoke cannot clear a new connection", async () => {
+  const window = browser();
+  const pendingKey = `daylight-google-calendar-pending-deletions-${userId}`;
+  window.localStorage.setItem(pendingKey, JSON.stringify(["deleted-event"]));
+  let releaseRevoke;
+  const revoking = new Promise((resolve) => { releaseRevoke = resolve; });
+  const client = loadClient(window, async (url, init) => {
+    if (url.startsWith("https://oauth2.googleapis.com/revoke")) {
+      assert.ok(init.signal instanceof AbortSignal);
+      return revoking;
+    }
+    return response(200, { items: [] });
+  });
+  const disconnected = client.disconnectGoogleCalendar();
+  assert.equal(client.googleCalendarIsConnected(userId), false);
+  assert.equal(window.localStorage.getItem(connectionKey), null);
+  assert.equal(window.localStorage.getItem(pendingKey), JSON.stringify(["deleted-event"]));
+  await client.connectGoogleCalendar(userId);
+  releaseRevoke(response(200));
+  await disconnected;
+  assert.equal(client.googleCalendarIsConnected(userId), true);
+});
+
+test("concurrent tabs create one Google event using the same deterministic identifier", async () => {
+  const window = browser();
+  const server = calendarServer();
+  const firstTab = loadClient(window, server.fetch);
+  const secondTab = loadClient(window, server.fetch);
+  await Promise.all([firstTab.syncGoogleCalendarEvent(event()), secondTab.syncGoogleCalendarEvent(event())]);
+  assert.equal(server.events.size, 1);
+  const inserts = server.calls.filter((call) => call.method === "POST");
+  assert.equal(inserts.length, 2, "Both tabs observed no event before either insert completed");
+  assert.equal(inserts[0].body.id, inserts[1].body.id);
+  assert.match(inserts[0].body.id, /^[0-9a-v]{5,1024}$/);
+  assert.equal(server.calls.filter((call) => call.method === "PATCH").length, 1, "The conflicting insert converges on the existing event");
+});
+
+test("the same schedule identifier in different workspace accounts does not adopt another owner's Google event", async () => {
+  const firstWindow = browser();
+  const server = calendarServer();
+  const firstClient = loadClient(firstWindow, server.fetch);
+  await firstClient.syncGoogleCalendarEvent(event());
+  const anotherWindow = browser();
+  anotherWindow.localStorage.setItem(connectionKey, JSON.stringify({ userId: "another-user" }));
+  anotherWindow.sessionStorage.setItem(tokenKey, JSON.stringify({ userId: "another-user", accessToken: "another-token", expiresAt: Date.now() + 3_600_000 }));
+  const secondClient = loadClient(anotherWindow, server.fetch);
+  await secondClient.syncGoogleCalendarEvent({ ...event(), userId: "another-user", title: "Other account's event" });
+  assert.equal(server.events.size, 2);
+  assert.deepEqual([...server.events.values()].map((item) => item.extendedProperties.private.daylightUserId).sort(), ["another-user", userId]);
+  assert.equal([...server.events.values()].find((item) => item.extendedProperties.private.daylightUserId === userId).summary, event().title);
+});
+
+test("a lost insert response remains idempotent while the property search is stale", async () => {
+  const window = browser();
+  const server = calendarServer();
+  let lost = false;
+  const client = loadClient(window, async (url, init = {}) => {
+    if (lost && !init.method && new URL(url).pathname.endsWith("/events")) return response(200, { items: [] });
+    const result = await server.fetch(url, init);
+    if (init.method === "POST" && !lost) { lost = true; throw new Error("Lost response"); }
+    return result;
+  });
+  await assert.rejects(client.syncGoogleCalendarEvent(event()), /Lost response/);
+  await client.syncGoogleCalendarEvent(event());
+  assert.equal(server.events.size, 1);
+  assert.equal(server.calls.filter((call) => call.method === "POST").length, 2);
+});
+
+test("a cancelled deterministic event can be restored when Google retains only its identifier and status", async () => {
+  const window = browser();
+  const server = calendarServer();
+  const client = loadClient(window, server.fetch);
+  await client.syncGoogleCalendarEvent(event());
+  const id = [...server.events.keys()][0];
+  server.events.set(id, { id, status: "cancelled" });
+  await client.syncGoogleCalendarEvent(event());
+  assert.equal(server.events.size, 1);
+  assert.equal(server.events.get(id).status, "confirmed");
+  assert.equal(server.events.get(id).summary, event().title);
+  assert.equal(server.events.get(id).extendedProperties.private.daylightEventId, event().id);
 });
 
 test("retry updates the existing event without creating duplicates", async () => {
@@ -296,6 +444,98 @@ test("sync clears recurrence when a weekly event becomes one-time", async () => 
   await client.syncGoogleCalendarEvent(event());
   assert.equal(server.events.size, 1);
   assert.equal([...server.events.values()][0].recurrence, null);
+});
+
+for (const fixture of [
+  { zone: "America/Los_Angeles", start: "2026-11-04T01:00:00.000Z", until: "2026-11-03", cutoff: "20261104T075959Z", weekday: 2 },
+  { zone: "America/New_York", start: "2026-10-25T13:00:00.000Z", until: "2026-11-01", cutoff: "20261102T045959Z", weekday: 0 },
+  { zone: "America/New_York", start: "2026-03-01T14:00:00.000Z", until: "2026-03-08", cutoff: "20260309T035959Z", weekday: 0 },
+]) {
+  test(`weekly cutoff uses the event timezone through ${fixture.zone} ${fixture.until}`, async () => {
+    const window = browser();
+    const server = calendarServer();
+    const client = loadClient(window, server.fetch);
+    await client.syncGoogleCalendarEvent({ ...event(), timezone: fixture.zone, startsAt: fixture.start,
+      endsAt: new Date(Date.parse(fixture.start) + 3_600_000).toISOString(), recurrenceWeekdays: [fixture.weekday], recurrenceUntil: fixture.until });
+    assert.ok([...server.events.values()][0].recurrence[0].endsWith(`;UNTIL=${fixture.cutoff}`));
+  });
+}
+
+test("bulk reconciliation restores orphan overrides, preserves saved changes, and removes obsolete slots", async () => {
+  const window = browser();
+  const server = calendarServer();
+  const series = { ...event(), title: "Current series title", recurrenceWeekdays: [2], recurrenceUntil: "2026-12-01" };
+  window.localStorage.setItem(linksKey, JSON.stringify({ "event-1": "parent" }));
+  const privateMarker = { private: { daylightEventId: series.id, daylightUserId: userId } };
+  server.events.set("parent", { id: "parent", extendedProperties: privateMarker });
+  const instance = (id, original, extras = {}) => ({ id, recurringEventId: "parent", status: "confirmed", summary: "Old override", originalStartTime: { dateTime: original }, extendedProperties: privateMarker, ...extras });
+  const overrides = [
+    instance("orphan-edit", "2026-11-17T10:00:00.000Z"),
+    instance("saved-skip", "2026-11-10T10:00:00.000Z", { status: "cancelled" }),
+    { id: "orphan-cancel", recurringEventId: "parent", status: "cancelled", originalStartTime: { dateTime: "2026-11-24T10:00:00.000Z" } },
+    instance("obsolete-time", "2026-11-17T11:00:00.000Z"),
+    instance("other-parent", "2026-11-17T10:00:00.000Z", { recurringEventId: "another-parent" }),
+  ];
+  for (const item of overrides) server.events.set(item.id, item);
+  const pages = [];
+  const client = loadClient(window, async (url, init = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith("/events") && parsed.searchParams.get("showDeleted") === "true") {
+      assert.equal(parsed.searchParams.get("singleEvents"), "false");
+      assert.equal(parsed.searchParams.has("privateExtendedProperty"), false, "Cancelled exceptions without private metadata must be discoverable");
+      assert.equal(server.calls.filter((call) => call.method !== "GET").length, 0, "Read all override pages before changing instances");
+      const page = parsed.searchParams.get("pageToken");
+      pages.push(page);
+      if (!page) return response(200, { items: [overrides[0]], nextPageToken: "empty" });
+      if (page === "empty") return response(200, { items: [], nextPageToken: "remaining" });
+      return response(200, { items: overrides.slice(1) });
+    }
+    return server.fetch(url, init);
+  });
+  await client.reconcileGoogleCalendarOccurrences(series, [{ eventId: series.id, originalStartsAt: "2026-11-10T10:00:00.000Z" }]);
+  assert.deepEqual(pages, [null, "empty", "remaining"]);
+  for (const id of ["orphan-edit", "orphan-cancel"]) {
+    assert.equal(server.events.get(id).status, "confirmed");
+    assert.equal(server.events.get(id).summary, series.title);
+    assert.equal(server.events.get(id).start.dateTime, server.events.get(id).originalStartTime.dateTime);
+  }
+  assert.equal(server.events.get("saved-skip").status, "cancelled");
+  assert.equal(server.events.get("other-parent").summary, "Old override");
+  assert.equal(server.events.has("obsolete-time"), false);
+  assert.deepEqual(server.calls.filter((call) => call.method === "PATCH").map((call) => call.url.pathname.split("/").at(-1)), ["orphan-edit", "orphan-cancel"]);
+});
+
+test("another browser can recover an owned deleted event without old browser links", async () => {
+  const window = browser();
+  const server = calendarServer();
+  const client = loadClient(window, server.fetch);
+  await client.syncGoogleCalendarEvent(event());
+  server.events.set("unrelated", { id: "unrelated", summary: "Unrelated appointment", extendedProperties: { private: { daylightEventId: "some-other-id" } } });
+  window.localStorage.removeItem(linksKey);
+  const anotherBrowser = loadClient(window, server.fetch);
+  const candidates = await anotherBrowser.googleCalendarRemoteDeletionCandidates(userId);
+  assert.deepEqual(Array.from(candidates), [event().id]);
+  assert.equal(await anotherBrowser.retryGoogleCalendarDeletions(userId, [], candidates), 1);
+  assert.equal(server.events.size, 1);
+  assert.ok(server.events.has("unrelated"));
+});
+
+test("remote deletion discovery paginates and excludes instances, other owners, and unmarked events", async () => {
+  const window = browser();
+  const marked = (id, owner = userId) => ({ id: `google-${id}`, extendedProperties: { private: { daylightEventId: id, daylightUserId: owner } } });
+  const queries = [];
+  const client = loadClient(window, async (url) => {
+    const params = new URL(url).searchParams;
+    assert.equal(params.get("privateExtendedProperty"), `daylightUserId=${userId}`);
+    const page = params.get("pageToken");
+    queries.push(page);
+    if (!page) return response(200, { items: [marked("first"), marked("wrong-owner", "another-user"), { id: "unmarked" }, { ...marked("instance"), recurringEventId: "parent" }], nextPageToken: "empty" });
+    if (page === "empty") return response(200, { items: [], nextPageToken: "last" });
+    return response(200, { items: [marked("last"), { ...marked("deleted"), status: "cancelled" }] });
+  });
+  assert.deepEqual(Array.from(await client.googleCalendarRemoteDeletionCandidates(userId)), ["first", "last"]);
+  assert.deepEqual(queries, [null, "empty", "last"]);
+  assert.deepEqual(JSON.parse(window.localStorage.getItem(linksKey)), { first: "google-first", last: "google-last" });
 });
 
 function recurringCalendar(instanceOverrides = {}) {
@@ -478,11 +718,14 @@ function bulkSync({ rows = [eventRow()], exceptions = [], exceptionsError = null
   const client = {
     googleCalendarIsConnected: () => true,
     googleCalendarDeletionCandidates: (uid) => { calls.push({ action: "candidates", uid }); return ["removed"]; },
+    googleCalendarRemoteDeletionCandidates: async (uid) => { calls.push({ action: "remoteCandidates", uid }); return []; },
     syncGoogleCalendarEvent: async (value) => { calls.push({ action: "event", value }); return syncResult; },
+    reconcileGoogleCalendarOccurrences: async (value, changes) => { calls.push({ action: "reconcile", value, changes }); },
     syncGoogleCalendarOccurrence: async (value, originalStartsAt, change) => { calls.push({ action: "occurrence", value, originalStartsAt, change }); return syncResult; },
     retryGoogleCalendarDeletions: async (uid, ids, candidates) => { calls.push({ action: "delete", uid, ids, candidates }); return 2; },
   };
   const syncModule = evaluate("src/lib/google-calendar/sync.ts", { window }, {
+    ...scheduleModules(),
     "@/lib/data/client": { cloudConfigured: cloud, database },
     "@/lib/data/schema": schema,
     "./client": client,
@@ -493,8 +736,8 @@ function bulkSync({ rows = [eventRow()], exceptions = [], exceptionsError = null
 test("bulk retry loads occurrence changes before changing Google Calendar", async () => {
   const { sync, calls } = bulkSync({ exceptionsError: new Error("Database offline") });
   await assert.rejects(sync(userId), /Database offline/);
-  assert.deepEqual(calls.map((call) => call.action), ["candidates", "loadEvents", "loadExceptions"]);
-  assert.equal(calls[1].args.length, 0, "Load the complete schedule without a visible date range");
+  assert.deepEqual(calls.map((call) => call.action), ["candidates", "remoteCandidates", "loadEvents", "loadExceptions"]);
+  assert.equal(calls.find((call) => call.action === "loadEvents").args.length, 0, "Load the complete schedule without a visible date range");
 });
 
 test("bulk retry applies events then valid occurrence overrides before deletion cleanup", async () => {
@@ -510,13 +753,16 @@ test("bulk retry applies events then valid occurrence overrides before deletion 
   });
   const result = await sync(userId);
   assert.deepEqual(JSON.parse(JSON.stringify(result)), { events: 3, occurrences: 1, deleted: 2 });
-  assert.deepEqual(calls.map((call) => call.action), ["candidates", "loadEvents", "loadExceptions", "event", "event", "event", "occurrence", "delete"]);
+  const writes = calls.filter((call) => ["event", "reconcile", "occurrence", "delete"].includes(call.action));
+  assert.deepEqual(writes.map((call) => call.action), ["event", "event", "event", "reconcile", "occurrence", "delete"]);
   const occurrence = calls.find((call) => call.action === "occurrence");
-  assert.equal(occurrence.change.startsAt, original);
-  assert.equal(occurrence.change.endsAt, "2026-11-10T11:00:00.000Z");
+  assert.equal(occurrence.originalStartsAt, original);
+  assert.equal(occurrence.change.startsAt, null);
+  assert.equal(occurrence.change.endsAt, null);
   assert.equal(occurrence.change.title, "Updated occurrence");
-  assert.deepEqual(Array.from(calls.at(-1).ids), ["event-1", "cancelled", "one-time"]);
-  assert.deepEqual(calls.at(-1).candidates, ["removed"]);
+  const cleanup = calls.find((call) => call.action === "delete");
+  assert.deepEqual(Array.from(cleanup.ids), ["event-1", "cancelled", "one-time"]);
+  assert.deepEqual(Array.from(cleanup.candidates), ["removed"]);
 });
 
 test("bulk retry does not report success or remove events when authorization is lost", async () => {
@@ -549,7 +795,7 @@ test("malformed local schedule prevents partial replay and deletion cleanup", as
   window.localStorage.setItem("daylight-lessons-2026-11-04", "invalid json");
   const { sync, calls } = bulkSync({ cloud: false, window });
   await assert.rejects(sync("local"), /2026-11-04 could not be loaded/);
-  assert.deepEqual(calls.map((call) => call.action), ["candidates"]);
+  assert.deepEqual(calls.map((call) => call.action), ["candidates", "remoteCandidates"]);
 });
 
 test("bulk cleanup preserves a Google event linked after the saved-schedule snapshot started", async () => {
@@ -568,6 +814,7 @@ test("bulk cleanup preserves a Google event linked after the saved-schedule snap
   };
   const schema = evaluate("src/lib/data/schema.ts");
   const syncModule = evaluate("src/lib/google-calendar/sync.ts", { window }, {
+    ...scheduleModules(),
     "@/lib/data/client": { cloudConfigured: true, database },
     "@/lib/data/schema": schema,
     "./client": client,

@@ -1,37 +1,38 @@
-import { addDays, dateKey } from "./dates";
+import { addDateKeyDays, dateKeyInTimeZone, dateTimeInTimeZone, timeInTimeZone } from "./timezone";
 import type { CalendarRange, ScheduleEvent, ScheduleEventException, ScheduleOccurrence } from "./types";
 
-function recurrenceTimestamp(value: string) {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toISOString();
+export function isOriginalOccurrence(event: ScheduleEvent, originalStartsAt: string): boolean {
+  const original = new Date(originalStartsAt);
+  const base = new Date(event.startsAt);
+  if (!Number.isFinite(original.getTime()) || original < base) return false;
+  if (!event.recurrenceWeekdays.length) return original.getTime() === base.getTime();
+  const zone = event.timezone;
+  const day = dateKeyInTimeZone(original, zone);
+  if (event.recurrenceUntil && day > event.recurrenceUntil) return false;
+  if (!event.recurrenceWeekdays.includes(new Date(`${day}T00:00:00Z`).getUTCDay())) return false;
+  const time = timeInTimeZone(base, zone, true);
+  if (timeInTimeZone(original, zone, true) !== time) return false;
+  if (day === dateKeyInTimeZone(base, zone)) return original.getTime() === base.getTime();
+  try { return dateTimeInTimeZone(day, time, zone).getTime() === original.getTime(); }
+  catch { return false; }
 }
 
 export function expandEvent(event: ScheduleEvent, exceptions: ScheduleEventException[], range: CalendarRange): ScheduleOccurrence[] {
   if (event.status === "cancelled" || event.status === "skipped") return [];
   const baseStart = new Date(event.startsAt);
-  const baseEnd = new Date(event.endsAt);
-  const duration = baseEnd.getTime() - baseStart.getTime();
+  const duration = new Date(event.endsAt).getTime() - baseStart.getTime();
   const recurring = event.recurrenceWeekdays.length > 0;
-  const results: ScheduleOccurrence[] = [];
-  const baseDate = new Date(baseStart.getFullYear(), baseStart.getMonth(), baseStart.getDate(), 12);
-  const rangeDate = new Date(range.start.getFullYear(), range.start.getMonth(), range.start.getDate(), 12);
-  const firstDate = recurring && baseDate < rangeDate ? rangeDate : recurring ? baseDate : baseStart;
-  const lastDate = recurring ? new Date(range.end.getFullYear(), range.end.getMonth(), range.end.getDate(), 12) : addDays(firstDate, 1);
-  const exceptionMap = new Map(exceptions.filter((exception) => exception.eventId === event.id).map((exception) => [recurrenceTimestamp(exception.originalStartsAt), exception]));
-
-  for (let cursor = firstDate; cursor < lastDate; cursor = addDays(cursor, 1)) {
-    if (recurring && !event.recurrenceWeekdays.includes(cursor.getDay())) continue;
-    const generatedStart = recurring
-      ? new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), baseStart.getHours(), baseStart.getMinutes())
-      : baseStart;
-    const exception = exceptionMap.get(recurrenceTimestamp(generatedStart.toISOString()));
-    if (exception?.status === "cancelled" || exception?.status === "skipped") continue;
-    const occurrenceStart = exception?.startsAt ? new Date(exception.startsAt) : generatedStart;
-    const occurrenceEnd = exception?.endsAt ? new Date(exception.endsAt) : new Date(occurrenceStart.getTime() + duration);
-    if (event.recurrenceUntil && dateKey(cursor) > event.recurrenceUntil) continue;
-    if (occurrenceStart >= range.end || occurrenceEnd <= range.start) continue;
-
-    results.push({
+  const relevant = exceptions.filter((exception) => exception.eventId === event.id);
+  const exceptionMap = new Map(relevant.map((exception) => [new Date(exception.originalStartsAt).toISOString(), exception]));
+  const results = new Map<string, ScheduleOccurrence>();
+  const append = (original: Date, exception?: ScheduleEventException) => {
+    if (exception?.status === "cancelled" || exception?.status === "skipped") return;
+    const starts = exception?.startsAt ? new Date(exception.startsAt) : original;
+    const ends = exception?.endsAt ? new Date(exception.endsAt) : new Date(starts.getTime() + duration);
+    if (starts >= range.end || ends <= range.start) return;
+    const originalStartsAt = original.toISOString();
+    const occurrenceKey = `${event.id}:${originalStartsAt}`;
+    results.set(occurrenceKey, {
       ...event,
       title: exception?.title ?? event.title,
       detail: exception?.detail ?? event.detail,
@@ -41,18 +42,41 @@ export function expandEvent(event: ScheduleEvent, exceptions: ScheduleEventExcep
       hourlyRate: exception?.hourlyRate ?? event.hourlyRate,
       fixedFee: exception?.fixedFee ?? event.fixedFee,
       status: exception?.status ?? event.status,
-      startsAt: occurrenceStart.toISOString(),
-      endsAt: occurrenceEnd.toISOString(),
-      occurrenceKey: `${event.id}:${generatedStart.toISOString()}`,
-      originalStartsAt: generatedStart.toISOString(),
+      startsAt: starts.toISOString(),
+      endsAt: ends.toISOString(),
+      occurrenceKey,
+      originalStartsAt,
       isRecurring: recurring,
       exceptionId: exception?.id,
     });
-    if (!recurring) break;
+  };
+
+  if (!recurring) {
+    append(baseStart, exceptionMap.get(baseStart.toISOString()));
+    return [...results.values()];
   }
-  return results;
+
+  const zone = event.timezone;
+  const baseDay = dateKeyInTimeZone(baseStart, zone);
+  const baseTime = timeInTimeZone(baseStart, zone, true);
+  const earliest = dateKeyInTimeZone(new Date(range.start.getTime() - duration), zone);
+  const lastDay = dateKeyInTimeZone(range.end, zone);
+  for (let day = earliest < baseDay ? baseDay : earliest; day <= lastDay; day = addDateKeyDays(day, 1)) {
+    if (event.recurrenceUntil && day > event.recurrenceUntil) break;
+    if (!event.recurrenceWeekdays.includes(new Date(`${day}T00:00:00Z`).getUTCDay())) continue;
+    let original: Date;
+    try { original = day === baseDay ? baseStart : dateTimeInTimeZone(day, baseTime, zone); }
+    catch { continue; } // A weekly clock time in the spring DST gap has no occurrence.
+    append(original, exceptionMap.get(original.toISOString()));
+  }
+
+  // A rescheduled occurrence can originate outside the visible range entirely.
+  for (const exception of relevant) {
+    if (isOriginalOccurrence(event, exception.originalStartsAt)) append(new Date(exception.originalStartsAt), exception);
+  }
+  return [...results.values()].sort((left, right) => left.startsAt.localeCompare(right.startsAt));
 }
 
 export function expandEvents(events: ScheduleEvent[], exceptions: ScheduleEventException[], range: CalendarRange) {
-  return events.flatMap((event) => expandEvent(event, exceptions, range));
+  return events.flatMap((event) => expandEvent(event, exceptions, range)).sort((left, right) => left.startsAt.localeCompare(right.startsAt) || left.occurrenceKey.localeCompare(right.occurrenceKey));
 }

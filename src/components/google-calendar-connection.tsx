@@ -111,10 +111,15 @@ export function GoogleCalendarConnection({ userId, children }: { userId: string;
   useEffect(() => {
     mounted.current = true;
     const prepare = () => { void prepareGoogleCalendar().catch(() => {}); };
-    const refresh = () => { void run("check"); };
+    const refresh = () => { void run("check", true); };
     const recovered = () => { prepare(); void run("check", true); };
+    const scheduleChanged = () => {
+      syncedOnLogin.current = false;
+      setNotice("");
+    };
     const changed = (event: StorageEvent) => {
-      if (event.key?.startsWith("daylight-google-calendar-")) refresh();
+      if (event.key === "daylight-schedule-version") scheduleChanged();
+      if (event.key === "daylight-google-calendar-connection") refresh();
     };
     prepare();
     const initialOperation = operation.current;
@@ -124,6 +129,7 @@ export function GoogleCalendarConnection({ userId, children }: { userId: string;
     window.addEventListener("focus", refresh);
     window.addEventListener("online", recovered);
     window.addEventListener("storage", changed);
+    window.addEventListener("daylight-schedule-changed", scheduleChanged);
     window.addEventListener(googleCalendarConnectionChangedEvent, refresh);
     return () => {
       mounted.current = false;
@@ -132,6 +138,7 @@ export function GoogleCalendarConnection({ userId, children }: { userId: string;
       window.removeEventListener("focus", refresh);
       window.removeEventListener("online", recovered);
       window.removeEventListener("storage", changed);
+      window.removeEventListener("daylight-schedule-changed", scheduleChanged);
       window.removeEventListener(googleCalendarConnectionChangedEvent, refresh);
     };
   }, [run]);

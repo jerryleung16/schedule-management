@@ -29,6 +29,7 @@ import { deleteGoogleCalendarEvent, syncGoogleCalendarEvent } from "@/lib/google
 import { availabilityConflicts, formatWeeklyAvailabilityMessage, lessonHours, normalizeWeeklyAvailability, occupiedAvailabilityByWeekday, parseWeeklyAvailabilityOverride, practicalFreeSlots, resolveWeeklyAvailability, slotConflicts, staminaState, validateWeeklyAvailability, weekStartKey, weeklyAvailabilityOverrideStorageKey, weeklyAvailabilityStorageKey } from "@/lib/schedule/availability";
 import { addDays, dateFromKey, dateKey, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
+import { dateKeyInTimeZone, timeInTimeZone } from "@/lib/schedule/timezone";
 import { normalizeWeeklyWorkingPlaces, workingPlaceStorageKey, workingPlacesToMap } from "@/lib/schedule/workplaces";
 import type { EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, Student, WeeklyAvailability, WeeklyAvailabilityByWeek, WeeklyAvailabilitySource, WeeklyWorkingPlace, WorkingPlacesByWeekday } from "@/lib/schedule/types";
 
@@ -48,11 +49,13 @@ type Lesson = {
   rate: number;
   studentId: string | null;
   status: EventStatus;
+  source?: ScheduleOccurrence;
+  originalDate?: string;
 };
 
 const storageKey = "daylight-lessons";
 const scheduleChangedEvent = "daylight-schedule-changed";
-const scheduleDate = new Date().toISOString().slice(0, 10);
+const scheduleDate = dateKey(new Date());
 const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const eventTones: EventTone[] = ["blue", "coral", "teal", "yellow", "violet"];
 
@@ -147,47 +150,40 @@ function initials(value: string) {
   return value.split(/\s+/).filter(Boolean).map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "ME";
 }
 
-function lessonFromRow(row: {
-  id: string;
-  starts_at: string;
-  ends_at: string;
-  title: string;
-  detail: string;
-  kind: Lesson["kind"];
-  tone: Lesson["tone"];
-  intensity: number;
-  prep_minutes: number;
-  travel_minutes: number;
-  hourly_rate: number;
-  student_id?: string | null;
-  status: EventStatus;
-}): Lesson {
-  const start = new Date(row.starts_at);
-  const end = new Date(row.ends_at);
+function lessonFromOccurrence(occurrence: ScheduleOccurrence): Lesson {
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   return {
-    id: row.id,
-    time: start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }),
-    end: end.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }),
-    title: row.title,
-    detail: row.detail,
-    kind: row.kind,
-    tone: row.tone,
-    intensity: Number(row.intensity),
-    prepMinutes: row.prep_minutes,
-    travelMinutes: row.travel_minutes,
-    rate: Number(row.hourly_rate),
-    studentId: row.student_id ? String(row.student_id) : null,
-    status: row.status,
+    id: occurrence.id,
+    time: timeInTimeZone(occurrence.startsAt, zone),
+    end: timeInTimeZone(occurrence.endsAt, zone),
+    title: occurrence.title,
+    detail: occurrence.detail,
+    kind: occurrence.kind,
+    tone: occurrence.tone,
+    intensity: occurrence.intensity,
+    prepMinutes: occurrence.prepMinutes,
+    travelMinutes: occurrence.travelMinutes,
+    rate: occurrence.hourlyRate,
+    studentId: occurrence.studentId,
+    status: occurrence.status,
+    source: occurrence,
   };
 }
 
 function lessonToScheduleRow(lesson: Lesson, userId: string, date: string) {
+  if (lesson.source?.isRecurring) throw new Error("Edit recurring events in My calendar to choose the correct scope.");
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const original = lesson.source;
+  const startsAt = original && dateKeyInTimeZone(original.startsAt, zone) === date && timeInTimeZone(original.startsAt, zone) === lesson.time
+    ? original.startsAt : new Date(`${date}T${lesson.time}:00`).toISOString();
+  const endsAt = original && dateKeyInTimeZone(original.endsAt, zone) === date && timeInTimeZone(original.endsAt, zone) === lesson.end
+    ? original.endsAt : new Date(`${date}T${lesson.end}:00`).toISOString();
   return {
     id: lesson.id,
     user_id: userId,
-    starts_at: new Date(`${date}T${lesson.time}:00`).toISOString(),
-    ends_at: new Date(`${date}T${lesson.end}:00`).toISOString(),
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    starts_at: startsAt,
+    ends_at: endsAt,
+    timezone: original?.timezone ?? zone,
     title: lesson.title.trim(),
     detail: lesson.detail.trim(),
     kind: lesson.kind,
@@ -197,7 +193,7 @@ function lessonToScheduleRow(lesson: Lesson, userId: string, date: string) {
     travel_minutes: lesson.travelMinutes,
     hourly_rate: lesson.rate,
     student_id: lesson.studentId,
-    fixed_fee: null,
+    fixed_fee: original?.fixedFee ?? null,
     status: lesson.status,
     recurrence_weekdays: [],
     recurrence_until: null,
@@ -336,6 +332,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
     const loadLessons = async () => {
       setDataError("");
       if (!cloudConfigured) {
@@ -403,6 +400,7 @@ export default function Home() {
 
       setLessons([]);
       const { data: userData, error: userError } = await database.auth.getUser();
+      if (cancelled) return;
       if (userError || !userData.user) {
         setDataError(userError?.message ?? "Sign in to load your schedule.");
         return;
@@ -415,13 +413,15 @@ export default function Home() {
       const monthEnd = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() + 1, 1, 0);
       const monthRange = { start: monthStart, end: monthEnd };
       const weekRange = rangeForView(dateFromKey(availabilityWeekDate), "week");
+      const dayRange = rangeForView(dateFromKey(selectedDate), "day");
       const [profileResult, studentResult, canonicalMonth, canonicalWeek, dailyResult] = await Promise.all([
         database.getProfile(),
         database.listStudents(true),
         database.listEvents(monthRange),
         database.listEvents(weekRange),
-        database.listDailyEvents(new Date(`${selectedDate}T00:00:00`).toISOString(), new Date(`${selectedDate}T23:59:59`).toISOString()),
+        database.listEvents(dayRange),
       ]);
+      if (cancelled) return;
       const { data: profileData, error: profileError } = profileResult;
       if (profileError) setDataError(profileError.message);
       if (profileData?.display_name) setDisplayName(profileData.display_name);
@@ -439,6 +439,7 @@ export default function Home() {
         const monthExceptions = monthIds.length
           ? await database.listExceptions(monthIds)
           : { data: [], error: null };
+        if (cancelled) return;
         if (monthExceptions.error) { setDataError(monthExceptions.error.message); return; }
         const monthOccurrences = expandEvents(monthEvents, (monthExceptions.data ?? []).map((row) => exceptionFromRow(row)), monthRange);
         const payableLessons = monthOccurrences.filter((occurrence) => occurrence.kind === "lesson" && occurrence.status !== "cancelled" && occurrence.status !== "skipped");
@@ -459,6 +460,7 @@ export default function Home() {
         let exceptions: ScheduleEventException[] = [];
         if (eventIds.length) {
           const { data: exceptionData, error: exceptionError } = await database.listExceptions(eventIds);
+          if (cancelled) return;
           if (exceptionError) { setDataError(exceptionError.message); return; }
           exceptions = (exceptionData ?? []).map((row) => exceptionFromRow(row));
         }
@@ -471,13 +473,17 @@ export default function Home() {
       if (error) {
         setDataError(error.message);
       } else {
-        setLessons((data ?? []).map((row) => lessonFromRow(row)));
+        const dayEvents = (data ?? []).map((row) => scheduleEventFromRow(row, userData.user.id));
+        const dayExceptionResult = await database.listExceptions(dayEvents.map((event) => event.id));
+        if (cancelled) return;
+        if (dayExceptionResult.error) { setDataError(dayExceptionResult.error.message); return; }
+        setLessons(expandEvents(dayEvents, dayExceptionResult.data.map(exceptionFromRow), dayRange).map(lessonFromOccurrence));
         hasLoadedLessons.current = true;
       }
     };
 
     const loadTimer = window.setTimeout(() => { void loadLessons(); }, 0);
-    return () => window.clearTimeout(loadTimer);
+    return () => { cancelled = true; window.clearTimeout(loadTimer); };
   }, [scheduleRefreshVersion, selectedDate, availabilityWeekDate]);
 
   useEffect(() => {
@@ -849,21 +855,30 @@ export default function Home() {
     setLessonModalOpen(true);
   };
 
+  const openLessonInCalendar = (lesson: Lesson) => {
+    const source = lesson.source;
+    const params = new URLSearchParams({ date: source ? dateKeyInTimeZone(source.startsAt, source.timezone) : selectedDate, student: "all" });
+    if (source) { params.set("event", source.id); params.set("occurrence", source.originalStartsAt); }
+    router.push(`/calendar?${params.toString()}`);
+  };
+
   const openLessonEditor = (lesson: Lesson) => {
+    if (lesson.source?.isRecurring) { openLessonInCalendar(lesson); return; }
     setLessonFormDate(selectedDate);
-    setEditingLesson({ ...lesson });
+    setEditingLesson({ ...lesson, originalDate: selectedDate });
     setLessonFormError("");
     setLessonModalOpen(true);
   };
 
   const openLesson = (lesson: Lesson) => {
     setLessonFormDate(selectedDate);
-    setEditingLesson({ ...lesson });
+    setEditingLesson({ ...lesson, originalDate: selectedDate });
     setLessonFormError("");
     setLessonDetailsOpen(true);
   };
 
   const requestLessonDelete = () => {
+    if (editingLesson?.source?.isRecurring) { openLessonInCalendar(editingLesson); return; }
     setLessonDetailsOpen(false);
     setLessonDeleteConfirmOpen(true);
   };
@@ -871,6 +886,7 @@ export default function Home() {
   const saveLesson = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!editingLesson) return;
+    if (editingLesson.source?.isRecurring) { openLessonInCalendar(editingLesson); return; }
     const lesson = editingLesson.kind === "lesson" ? editingLesson : { ...editingLesson, studentId: null };
     if (!lesson.title.trim()) {
       setLessonFormError("Give this block a name first.");
@@ -882,8 +898,8 @@ export default function Home() {
     }
     const proposedStart = new Date(`${lessonFormDate}T${lesson.time}:00`);
     const proposedEnd = new Date(`${lessonFormDate}T${lesson.end}:00`);
-    const editingExisting = lessons.some((item) => item.id === lesson.id);
-    if (!editingExisting && slotConflicts(proposedStart, proposedEnd, weeklyOccurrences)) {
+    const editingExisting = Boolean(lesson.source || lesson.originalDate) || lessons.some((item) => item.id === lesson.id);
+    if (slotConflicts(proposedStart, proposedEnd, [...weeklyOccurrences, ...lessons.map((item) => item.source ?? localLessonOccurrence(item, selectedDate))].filter((item) => item.id !== lesson.id))) {
       setLessonFormError("That time overlaps an existing event.");
       return;
     }
@@ -893,12 +909,31 @@ export default function Home() {
         return;
       }
       setIsCloudSaving(true);
-      const { error } = await database.saveEvent(lessonToScheduleRow(lesson, userId, lessonFormDate));
+      const targetRange = rangeForView(dateFromKey(lessonFormDate), "day");
+      const targetEvents = await database.listEvents(targetRange);
+      if (targetEvents.error) { setIsCloudSaving(false); setLessonFormError(targetEvents.error.message); return; }
+      const targetExceptions = await database.listExceptions(targetEvents.data.map((item) => item.id));
+      if (targetExceptions.error) { setIsCloudSaving(false); setLessonFormError(targetExceptions.error.message); return; }
+      const targetOccurrences = expandEvents(targetEvents.data.map((row) => scheduleEventFromRow(row, userId)), targetExceptions.data.map(exceptionFromRow), targetRange);
+      if (slotConflicts(proposedStart, proposedEnd, targetOccurrences.filter((item) => item.id !== lesson.id))) { setIsCloudSaving(false); setLessonFormError("That time overlaps an existing event."); return; }
+      const payload = lessonToScheduleRow(lesson, userId, lessonFormDate);
+      const { error } = editingExisting ? await database.updateEvent(lesson.id, payload) : await database.saveEvent(payload);
       setIsCloudSaving(false);
       if (error) {
         setLessonFormError(error.message);
         return;
       }
+    } else {
+      try {
+        const targetKey = `${storageKey}-${lessonFormDate}`;
+        const target: Lesson[] = JSON.parse(window.localStorage.getItem(targetKey) ?? "[]");
+        window.localStorage.setItem(targetKey, JSON.stringify([...target.filter((item) => item.id !== lesson.id), { ...lesson, originalDate: lessonFormDate }]));
+        if (lesson.originalDate && lesson.originalDate !== lessonFormDate) {
+          const originalKey = `${storageKey}-${lesson.originalDate}`;
+          const original: Lesson[] = JSON.parse(window.localStorage.getItem(originalKey) ?? "[]");
+          window.localStorage.setItem(originalKey, JSON.stringify(original.filter((item) => item.id !== lesson.id)));
+        }
+      } catch { setLessonFormError("The saved schedule in this browser could not be updated."); return; }
     }
     setSelectedDate(lessonFormDate);
     setLessons((current) => current.some((item) => item.id === lesson.id)
@@ -906,11 +941,13 @@ export default function Home() {
       : [...current, lesson]);
     setLessonModalOpen(false);
     setEditingLesson(null);
+    notifyScheduleChanged();
     await syncOverviewEvent(lesson, lessonFormDate);
   };
 
   const deleteLesson = async () => {
     if (!editingLesson) return;
+    if (editingLesson.source?.isRecurring) { openLessonInCalendar(editingLesson); return; }
     if (cloudConfigured) {
       setIsCloudSaving(true);
       const { error } = await database.deleteEvent(editingLesson.id);
@@ -919,6 +956,12 @@ export default function Home() {
         setLessonFormError(error.message);
         return;
       }
+    } else {
+      try {
+        const dayKey = `${storageKey}-${editingLesson.originalDate ?? lessonFormDate}`;
+        const saved: Lesson[] = JSON.parse(window.localStorage.getItem(dayKey) ?? "[]");
+        window.localStorage.setItem(dayKey, JSON.stringify(saved.filter((item) => item.id !== editingLesson.id)));
+      } catch { setLessonFormError("The saved schedule in this browser could not be updated."); return; }
     }
     setLessons((current) => current.filter((lesson) => lesson.id !== editingLesson.id));
     setLessonModalOpen(false);
@@ -1027,7 +1070,7 @@ export default function Home() {
                 <div className="schedule-track">
                   <div className="schedule-line line-1" /><div className="schedule-line line-2" /><div className="schedule-line line-3" /><div className="schedule-line line-4" /><div className="schedule-line line-5" /><div className="schedule-line line-6" /><div className="schedule-line line-7" />
                   <div className="now-line"><span>NOW</span></div>
-                  {lessons.filter((item) => minutesFromTime(item.end) > HOMEPAGE_SCHEDULE_START_MINUTES && minutesFromTime(item.time) < HOMEPAGE_SCHEDULE_END_MINUTES).map((item) => <button className={`schedule-event event-${item.tone}`} key={item.id} onClick={() => openLesson(item)} style={homepageScheduleStyle(item.time, item.end)}>
+                  {lessons.filter((item) => minutesFromTime(item.end) > HOMEPAGE_SCHEDULE_START_MINUTES && minutesFromTime(item.time) < HOMEPAGE_SCHEDULE_END_MINUTES).map((item) => <button className={`schedule-event event-${item.tone}`} key={item.source?.occurrenceKey ?? item.id} onClick={() => openLesson(item)} style={homepageScheduleStyle(item.time, item.end)}>
                     <strong>{item.title}</strong><span>{item.detail}</span><small>{item.time} – {item.end}</small>
                   </button>)}
                 </div>
@@ -1067,7 +1110,7 @@ export default function Home() {
         <section className="lesson-modal event-details-modal" role="dialog" aria-modal="true" aria-labelledby="lesson-details-title">
           <div className="modal-heading"><div><p className="section-kicker">Schedule block</p><h2 id="lesson-details-title">{editingLesson.title}</h2><p className="calendar-subtitle">{new Date(`${lessonFormDate}T12:00:00`).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p></div><button className="modal-close" aria-label="Close schedule details" onClick={() => setLessonDetailsOpen(false)}><X size={18} /></button></div>
           <div className="event-detail-grid"><div><span>Time</span><strong>{editingLesson.time}–{editingLesson.end}</strong></div><div><span>Type</span><strong>{editingLesson.kind === "lesson" ? "Lesson" : "Personal"}</strong></div>{editingLesson.kind === "lesson" && <div><span>Student</span><strong>{students.find((student) => student.id === editingLesson.studentId)?.name ?? "No student linked"}</strong></div>}<div><span>Rate</span><strong>{editingLesson.kind === "lesson" ? `$${editingLesson.rate}/h` : "Not applicable"}</strong></div><div><span>Travel</span><strong>{editingLesson.travelMinutes} minutes</strong></div><div><span>Status</span><strong>{editingLesson.status}</strong></div>{editingLesson.detail && <div className="event-detail-wide"><span>Notes</span><strong>{editingLesson.detail}</strong></div>}</div>
-          <div className="modal-footer"><button type="button" className="delete-button" onClick={requestLessonDelete}>Delete block</button><span /><button type="button" className="secondary-button" onClick={() => { setLessonDetailsOpen(false); openLessonEditor(editingLesson); }}>Edit</button></div>
+          <div className="modal-footer">{editingLesson.source?.isRecurring ? <><p className="settings-help">This is a recurring event. Open My calendar to edit or delete one occurrence or the series.</p><span /><button type="button" className="primary-button" onClick={() => openLessonInCalendar(editingLesson)}><CalendarDays size={15} /> Open in My calendar</button></> : <><button type="button" className="delete-button" onClick={requestLessonDelete}>Delete block</button><span /><button type="button" className="secondary-button" onClick={() => { setLessonDetailsOpen(false); openLessonEditor(editingLesson); }}>Edit</button></>}</div>
         </section>
       </div>}
       {lessonDeleteConfirmOpen && editingLesson && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !isCloudSaving) setLessonDeleteConfirmOpen(false); }}>
