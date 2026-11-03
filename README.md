@@ -51,11 +51,16 @@ NEXT_PUBLIC_GOOGLE_CLIENT_ID=your-web-application-client-id.apps.googleuserconte
 
 Google Calendar sync runs in the browser so it works with the static GitHub Pages deployment. Daylight requests the Calendar events scope and only creates, updates, or removes events that Daylight owns. It never imports Google Calendar events or applies Google-side edits back to the schedule. Access tokens stay in the browser session and can be revoked from Settings by disconnecting the calendar.
 
+Open **My calendar** and use **Sync to Google Calendar** to resend the complete saved schedule after a connection failure. The connection panel also lets you connect or reconnect without leaving My calendar. Sync replays recurring-event changes and retries deletions remembered by this browser.
+
+After each workspace login, Daylight verifies Google Calendar access and syncs the saved schedule when authorization is valid. It checks again when the browser regains focus, the network returns, or the token expires. Google requires a user gesture to renew expired authorization, so Daylight shows a Connect/Reconnect button when needed; it never treats an expired token or failed network request as a verified connection. Authorization is scoped to the signed-in workspace account.
+
 ## Validate
 
 ```bash
 npm run lint
 npm run build
+node --test scripts/google-calendar.test.mjs
 ```
 
 The calendar uses the profile timezone for display, expands weekly events only within the visible range, and keeps the event series separate from occurrence exceptions. Scheduled events do not count toward actual earnings; completed lesson events use hourly duration multiplied by rate, while skipped and cancelled events are excluded.

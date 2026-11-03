@@ -2,7 +2,8 @@
 
 import { FormEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
-import { CalendarDays, ChevronLeft, ChevronRight, Clock3, Plus, Sparkles, X } from "lucide-react";
+import { CalendarDays, Check, ChevronLeft, ChevronRight, Clock3, Link2, Plus, RotateCw, Sparkles, X } from "lucide-react";
+import { useGoogleCalendarConnection } from "@/components/google-calendar-connection";
 import { database, cloudConfigured } from "@/lib/data/client";
 import { getFirebase } from "@/lib/firebase/client";
 import { deleteGoogleCalendarEvent, syncGoogleCalendarEvent, syncGoogleCalendarOccurrence } from "@/lib/google-calendar/client";
@@ -141,6 +142,7 @@ function eventStyle(occurrence: ScheduleOccurrence, lane: number, laneCount: num
 
 export default function CalendarPage() {
   const router = useRouter();
+  const googleCalendar = useGoogleCalendarConnection();
   const [view, setView] = useState<CalendarView>("week");
   const todayKey = useSyncExternalStore(subscribeToBrowser, getBrowserDateKey, getInitialDateKey);
   const [anchorDate, setAnchorDate] = useState(dateFromKey(initialDateKey));
@@ -670,14 +672,34 @@ export default function CalendarPage() {
     <main className="calendar-shell">
       <header className="calendar-topbar">
         <button className="back-link" onClick={() => router.push("/")}><ChevronLeft size={16} /> Overview</button>
-        <div className="calendar-brand"><span className="brand-mark"><Sparkles size={15} /></span><strong>daylight</strong><span>Calendar</span></div>
+        <div className="calendar-brand"><span className="brand-mark"><Sparkles size={15} /></span><strong>daylight</strong><span>My calendar</span></div>
         <button className="profile-mini" aria-label="Back to dashboard" onClick={() => router.push("/")}><CalendarDays size={17} /></button>
       </header>
       <div className="calendar-content">
         <div className="calendar-intro">
-          <div><p className="section-kicker">Your time, in view</p><h1>Calendar</h1><p className="calendar-subtitle">Plan one-time blocks and weekly rhythms without losing the shape of your week.</p></div>
-          <button className="primary-button" onClick={() => openEditor()}><Plus size={17} /> Add event</button>
+          <div><p className="section-kicker">Your time, in view</p><h1>My calendar</h1><p className="calendar-subtitle">Plan one-time blocks and weekly rhythms without losing the shape of your week.</p></div>
+          <div className="calendar-intro-actions">
+            <button className="primary-button" onClick={() => openEditor()}><Plus size={17} /> Add event</button>
+          </div>
         </div>
+        <section className="panel calendar-google-sync" aria-labelledby="google-calendar-heading">
+          <div className="calendar-google-sync-main">
+            <div className="calendar-google-sync-copy">
+              <h2 id="google-calendar-heading"><CalendarDays size={18} /> Google Calendar</h2>
+              <p className="google-calendar-status" role="status"><span className={googleCalendar.status === "connected" ? "google-status-dot google-status-connected" : "google-status-dot"} /> {googleCalendar.status === "checking" ? "Checking connection..." : googleCalendar.status === "connected" ? "Connected" : googleCalendar.status === "reconnect-required" ? "Reconnect required" : googleCalendar.status === "error" ? "Connection needs attention" : "Not connected"}</p>
+              <p className="settings-help">Your connection is checked when you sign in. Use Sync to Google Calendar to resend saved changes after a connection problem.</p>
+              {!googleCalendar.configured && <p className="settings-help">Google Calendar is not configured for this website yet.</p>}
+              {googleCalendar.status === "reconnect-required" && <p className="settings-help">Google needs you to renew access. Reconnect here to sync your saved schedule.</p>}
+            </div>
+            <div className="google-calendar-actions calendar-google-sync-actions">
+              {(googleCalendar.status === "not-connected" || googleCalendar.status === "reconnect-required" || googleCalendar.busy === "connect") && <button type="button" className="primary-button" disabled={!googleCalendar.configured || Boolean(googleCalendar.busy)} aria-busy={googleCalendar.busy === "connect"} onClick={() => void googleCalendar.connectAndSync()}><Link2 size={15} /> {googleCalendar.busy === "connect" ? "Connecting and syncing..." : googleCalendar.status === "reconnect-required" ? "Reconnect Google Calendar" : "Connect Google Calendar"}</button>}
+              {googleCalendar.status === "error" && <button type="button" className="secondary-button" disabled={Boolean(googleCalendar.busy)} onClick={() => void googleCalendar.check()}><RotateCw size={15} /> Retry connection</button>}
+              <button type="button" className={googleCalendar.status === "connected" ? "primary-button" : "secondary-button"} disabled={!googleCalendar.configured || googleCalendar.status !== "connected" || Boolean(googleCalendar.busy)} aria-busy={googleCalendar.busy === "sync"} onClick={() => void googleCalendar.sync()}><RotateCw size={15} className={googleCalendar.busy === "sync" ? "sync-spinning" : undefined} /> {googleCalendar.busy === "sync" ? "Syncing..." : "Sync to Google Calendar"}</button>
+            </div>
+          </div>
+          {googleCalendar.notice && <p className="calendar-google-sync-notice" role="status"><Check size={14} /> {googleCalendar.notice}</p>}
+          {googleCalendar.error && <p className="calendar-google-sync-error" role="alert">{googleCalendar.error}</p>}
+        </section>
         {notice && <div className="data-success" role="status">{notice}</div>}
         {error && <div className="data-error" role="alert">{error}</div>}
         <section className="calendar-panel">
