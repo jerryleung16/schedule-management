@@ -857,8 +857,8 @@ export default function Home() {
 
   const openLessonInCalendar = (lesson: Lesson) => {
     const source = lesson.source;
-    const params = new URLSearchParams({ date: source ? dateKeyInTimeZone(source.startsAt, source.timezone) : selectedDate, student: "all" });
-    if (source) { params.set("event", source.id); params.set("occurrence", source.originalStartsAt); }
+    const params = new URLSearchParams({ date: selectedDate, student: "all" });
+    if (source) { params.set("event", source.id); params.set("occurrence", source.originalStartsAt); params.set("at", source.startsAt); }
     router.push(`/calendar?${params.toString()}`);
   };
 

@@ -67,7 +67,7 @@ npm run build
 npm test
 ```
 
-The calendar uses the profile timezone for display, expands weekly events only within the visible range, and keeps the event series separate from occurrence exceptions. Scheduled events do not count toward actual earnings; completed lesson events use hourly duration multiplied by rate, while skipped and cancelled events are excluded.
+The calendar displays your device's timezone by default. Its Timezone control can explicitly select the saved profile timezone instead; grid positions, labels, details, and date boundaries always use the selected display timezone. Existing events retain their stored instants and recurrence timezone, which is labelled when editing. Weekly expansion keeps event series separate from occurrence exceptions. Scheduled events do not count toward actual earnings; completed lesson events use hourly duration multiplied by rate, while skipped and cancelled events are excluded.
 
 ## Deploy to GitHub Pages
 
