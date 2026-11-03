@@ -2,7 +2,19 @@ import { cloudConfigured, database } from "@/lib/data/client";
 import { normalizeRecord, safeId, type EventRow, type ExceptionRow } from "@/lib/data/schema";
 import type { ScheduleEvent, ScheduleEventException } from "@/lib/schedule/types";
 import { isOriginalOccurrence } from "@/lib/schedule/recurrence";
-import { googleCalendarDeletionCandidates, googleCalendarIsConnected, googleCalendarRemoteDeletionCandidates, reconcileGoogleCalendarOccurrences, retryGoogleCalendarDeletions, syncGoogleCalendarEvent, syncGoogleCalendarOccurrence, type GoogleCalendarSyncResult } from "./client";
+import { googleCalendarDeletionCandidates, googleCalendarIsConnected, googleCalendarRemoteDeletionCandidates, loadGoogleCalendarOverrides, reconcileGoogleCalendarOccurrences, retryGoogleCalendarDeletions, syncGoogleCalendarEvent, syncGoogleCalendarOccurrence, type GoogleCalendarSyncResult } from "./client";
+
+export const googleCalendarSyncCompletedEvent = "daylight-google-calendar-sync-completed";
+const completedSyncs = new Map<string, { at: string; version: string | null }>();
+
+export function googleCalendarLastSync(userId: string): { at: string; version: string | null } | null {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(`daylight-google-calendar-last-sync-${userId}`) ?? "null") as { at?: unknown; version?: unknown } | null;
+    const memory = completedSyncs.get(userId) ?? null;
+    const valid = stored && typeof stored.at === "string" && Number.isFinite(Date.parse(stored.at)) && (stored.version === null || typeof stored.version === "string") ? { at: stored.at, version: stored.version } : null;
+    return valid && (!memory || Date.parse(valid.at) >= Date.parse(memory.at)) ? valid : memory;
+  } catch { return completedSyncs.get(userId) ?? null; }
+}
 
 function scheduleEventFromRow(row: EventRow): ScheduleEvent {
   return {
@@ -141,11 +153,12 @@ async function replaySavedSchedule(userId: string): Promise<SyncSummary> {
         assertCurrent();
       }
       let occurrences = 0;
+      const overrides = snapshot.events.some(event => event.recurrenceWeekdays.length && event.status !== "cancelled" && event.status !== "skipped") ? await loadGoogleCalendarOverrides(userId) : [];
       for (const event of snapshot.events) {
         if (!event.recurrenceWeekdays.length || event.status === "cancelled" || event.status === "skipped") continue;
         const changes = snapshot.changes.filter((change) => change.eventId === event.id && isOriginalOccurrence(event, change.originalStartsAt));
         assertCurrent();
-        await reconcileGoogleCalendarOccurrences(event, changes);
+        await reconcileGoogleCalendarOccurrences(event, changes, overrides);
         assertCurrent();
         for (const change of changes) {
           assertCurrent();
@@ -159,6 +172,12 @@ async function replaySavedSchedule(userId: string): Promise<SyncSummary> {
       await verifySnapshot();
       const deleted = await retryGoogleCalendarDeletions(userId, snapshot.events.map((event) => event.id), deletionCandidates);
       await verifySnapshot();
+      const completed = { at: new Date().toISOString(), version };
+      completedSyncs.set(userId, completed);
+      try {
+        window.localStorage.setItem(`daylight-google-calendar-last-sync-${userId}`, JSON.stringify(completed));
+      } catch { /* Sync already succeeded even if browser storage is unavailable. */ }
+      try { window.dispatchEvent(new Event(googleCalendarSyncCompletedEvent)); } catch { }
       return { events: snapshot.events.length, occurrences, deleted };
     } catch (error) {
       if (!(error instanceof ScheduleChangedDuringSync)) throw error;

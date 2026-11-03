@@ -25,12 +25,13 @@ import {
   X,
 } from "lucide-react";
 import { database, cloudConfigured } from "@/lib/data/client";
-import { deleteGoogleCalendarEvent, syncGoogleCalendarEvent } from "@/lib/google-calendar/client";
-import { availabilityConflicts, formatWeeklyAvailabilityMessage, lessonHours, normalizeWeeklyAvailability, occupiedAvailabilityByWeekday, parseWeeklyAvailabilityOverride, practicalFreeSlots, resolveWeeklyAvailability, slotConflicts, staminaState, validateWeeklyAvailability, weekStartKey, weeklyAvailabilityOverrideStorageKey, weeklyAvailabilityStorageKey } from "@/lib/schedule/availability";
+import { deleteGoogleCalendarEvent, googleCalendarErrorMessage, syncGoogleCalendarEvent } from "@/lib/google-calendar/client";
+import { availabilityConflicts, formatWeeklyAvailabilityMessage, normalizeWeeklyAvailability, occupiedAvailabilityByWeekday, parseWeeklyAvailabilityOverride, practicalFreeSlots, resolveWeeklyAvailability, slotConflicts, validateWeeklyAvailability, weekStartKey, weeklyAvailabilityOverrideStorageKey, weeklyAvailabilityStorageKey } from "@/lib/schedule/availability";
 import { addDays, dateFromKey, dateKey, rangeForView } from "@/lib/schedule/dates";
 import { expandEvents } from "@/lib/schedule/recurrence";
 import { dateKeyInTimeZone, timeInTimeZone } from "@/lib/schedule/timezone";
 import { normalizeWeeklyWorkingPlaces, workingPlaceStorageKey, workingPlacesToMap } from "@/lib/schedule/workplaces";
+import { emptyEarningsSummary, summarizeLessonEarnings, teachingCapacity, teachingHoursInRange, validTeachingHourLimit, type EarningsSummary } from "@/lib/schedule/overview";
 import type { EventStatus, EventTone, ScheduleEvent, ScheduleEventException, ScheduleOccurrence, Student, WeeklyAvailability, WeeklyAvailabilityByWeek, WeeklyAvailabilitySource, WeeklyWorkingPlace, WorkingPlacesByWeekday } from "@/lib/schedule/types";
 
 type IconComponent = typeof LayoutDashboard;
@@ -47,6 +48,7 @@ type Lesson = {
   prepMinutes: number;
   travelMinutes: number;
   rate: number;
+  fixedFee?: number | null;
   studentId: string | null;
   status: EventStatus;
   source?: ScheduleOccurrence;
@@ -60,7 +62,7 @@ const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "F
 const eventTones: EventTone[] = ["blue", "coral", "teal", "yellow", "violet"];
 
 function notifyScheduleChanged() {
-  window.localStorage.setItem("daylight-schedule-version", String(Date.now()));
+  window.localStorage.setItem("daylight-schedule-version", crypto.randomUUID());
   window.dispatchEvent(new Event(scheduleChangedEvent));
 }
 
@@ -140,6 +142,11 @@ function formatResult(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
 }
 
+function lessonRateLabel(lesson: Lesson) {
+  const fixedFee = lesson.fixedFee ?? lesson.source?.fixedFee;
+  return fixedFee !== undefined && fixedFee !== null ? `$${fixedFee} fixed fee` : `$${lesson.rate}/h`;
+}
+
 function weekNumber(dateValue: string) {
   const date = new Date(`${dateValue}T12:00:00`);
   const firstDay = new Date(date.getFullYear(), 0, 1, 12);
@@ -164,6 +171,7 @@ function lessonFromOccurrence(occurrence: ScheduleOccurrence): Lesson {
     prepMinutes: occurrence.prepMinutes,
     travelMinutes: occurrence.travelMinutes,
     rate: occurrence.hourlyRate,
+    fixedFee: occurrence.fixedFee,
     studentId: occurrence.studentId,
     status: occurrence.status,
     source: occurrence,
@@ -193,7 +201,7 @@ function lessonToScheduleRow(lesson: Lesson, userId: string, date: string) {
     travel_minutes: lesson.travelMinutes,
     hourly_rate: lesson.rate,
     student_id: lesson.studentId,
-    fixed_fee: original?.fixedFee ?? null,
+    fixed_fee: lesson.fixedFee ?? original?.fixedFee ?? null,
     status: lesson.status,
     recurrence_weekdays: [],
     recurrence_until: null,
@@ -241,7 +249,7 @@ function localLessonOccurrence(lesson: Lesson, date: string): ScheduleOccurrence
     prepMinutes: lesson.prepMinutes,
     travelMinutes: lesson.travelMinutes,
     hourlyRate: lesson.rate,
-    fixedFee: null,
+    fixedFee: lesson.fixedFee ?? null,
     status: lesson.status,
     recurrenceWeekdays: [],
     recurrenceUntil: null,
@@ -284,15 +292,16 @@ export default function Home() {
   const [defaultLessonRate, setDefaultLessonRate] = useState(35);
   const [defaultTravelMinutes, setDefaultTravelMinutes] = useState(0);
   const [defaultLessonTone, setDefaultLessonTone] = useState<EventTone>("coral");
-    const [students, setStudents] = useState<Student[]>([]);
+  const [dailyTeachingLimit, setDailyTeachingLimit] = useState(16);
+  const [weeklyTeachingLimit, setWeeklyTeachingLimit] = useState(40);
+  const [students, setStudents] = useState<Student[]>([]);
   const [dataError, setDataError] = useState("");
   const [notice, setNotice] = useState("");
   const [activeNav, setActiveNav] = useState("Overview");
   const [selectedDate, setSelectedDate] = useState(scheduleDate);
   const [scheduleRefreshVersion, setScheduleRefreshVersion] = useState(0);
   const [isCloudSaving, setIsCloudSaving] = useState(false);
-  const [monthlyCompletedEarnings, setMonthlyCompletedEarnings] = useState(0);
-  const [monthlyCompletedCount, setMonthlyCompletedCount] = useState(0);
+  const [monthlyEarnings, setMonthlyEarnings] = useState<EarningsSummary>(emptyEarningsSummary);
   const [weeklyLessonHours, setWeeklyLessonHours] = useState(0);
   const [weeklyOccurrences, setWeeklyOccurrences] = useState<ScheduleOccurrence[]>([]);
   const [availabilityWeekDate, setAvailabilityWeekDate] = useState(scheduleDate);
@@ -311,11 +320,25 @@ export default function Home() {
   const [availabilityMessage, setAvailabilityMessage] = useState("");
   const [availabilityError, setAvailabilityError] = useState("");
   const [availabilitySaving, setAvailabilitySaving] = useState(false);
+  const [availabilityLoading, setAvailabilityLoading] = useState(true);
+  const [availabilityLoadedKey, setAvailabilityLoadedKey] = useState("");
+  const [availabilityLoadVersion, setAvailabilityLoadVersion] = useState(0);
   const [calculatorValue, setCalculatorValue] = useState("128 / 4");
   const [calculatorResult, setCalculatorResult] = useState("32");
   const [calculatorError, setCalculatorError] = useState("");
 
   const selectedAvailabilityWeekStart = weekStartKey(availabilityWeekDate);
+  const availabilityLoadKey = `${userId}:${selectedAvailabilityWeekStart}:${availabilityEditMode}:${availabilityLoadVersion}`;
+  const availabilityReady = availabilityLoadedKey === availabilityLoadKey && !availabilityLoading;
+
+  useEffect(() => {
+    // Retry an incomplete read after reconnection, without discarding a form in progress.
+    const recovered = () => {
+      if (!availabilityReady && !availabilityLoading) setAvailabilityLoadVersion(value => value + 1);
+    };
+    window.addEventListener("online", recovered);
+    return () => window.removeEventListener("online", recovered);
+  }, [availabilityLoading, availabilityReady]);
 
   useEffect(() => {
     const refresh = () => setScheduleRefreshVersion((current) => current + 1);
@@ -340,14 +363,16 @@ export default function Home() {
         const savedSettings = window.localStorage.getItem("daylight-settings");
                 const savedStudents = window.localStorage.getItem("daylight-students");
                 if (savedStudents) {
-                  try { setStudents(JSON.parse(savedStudents) as Student[]); } catch { window.localStorage.removeItem("daylight-students"); }
+                  try { setStudents((JSON.parse(savedStudents) as Student[]).map(student => ({ ...student, status: student.status === "archived" ? "archived" : "active" }))); } catch { window.localStorage.removeItem("daylight-students"); }
                 }
         if (savedSettings) {
           try {
-            const settings = JSON.parse(savedSettings) as { defaultLessonRate?: number; defaultTravelMinutes?: number; defaultLessonTone?: EventTone };
+            const settings = JSON.parse(savedSettings) as { defaultLessonRate?: number; defaultTravelMinutes?: number; defaultLessonTone?: EventTone; dailyStaminaLimit?: number; weeklyStaminaLimit?: number };
             if (settings.defaultLessonRate !== undefined) setDefaultLessonRate(settings.defaultLessonRate);
             if (settings.defaultTravelMinutes !== undefined) setDefaultTravelMinutes(settings.defaultTravelMinutes);
             if (settings.defaultLessonTone) setDefaultLessonTone(settings.defaultLessonTone);
+            setDailyTeachingLimit(validTeachingHourLimit(settings.dailyStaminaLimit, 16));
+            setWeeklyTeachingLimit(validTeachingHourLimit(settings.weeklyStaminaLimit, 40));
           } catch { window.localStorage.removeItem("daylight-settings"); }
         }
         let selectedLessons: Lesson[] = [];
@@ -358,13 +383,13 @@ export default function Home() {
           } catch {
             window.localStorage.removeItem(`${storageKey}-${selectedDate}`);
           }
-        } else if (selectedDate !== scheduleDate) {
+        } else {
           setLessons([]);
         }
         const localMonth = new Date(`${selectedDate}T12:00:00`);
         const localMonthStart = new Date(localMonth.getFullYear(), localMonth.getMonth(), 1, 12);
         const localMonthEnd = new Date(localMonth.getFullYear(), localMonth.getMonth() + 1, 1, 12);
-        const monthLessons: Lesson[] = [];
+        const monthOccurrences: ScheduleOccurrence[] = [];
         for (let day = new Date(localMonthStart); day < localMonthEnd; day = addDays(day, 1)) {
           const dayKey = dateKey(day);
           let dayLessons: Lesson[] = [];
@@ -375,11 +400,9 @@ export default function Home() {
             if (!stored) continue;
             try { dayLessons = JSON.parse(stored) as Lesson[]; } catch { continue; }
           }
-          monthLessons.push(...dayLessons);
+          monthOccurrences.push(...dayLessons.map(lesson => localLessonOccurrence(lesson, dayKey)));
         }
-        const payableLessons = monthLessons.filter((lesson) => lesson.kind === "lesson" && lesson.status !== "cancelled" && lesson.status !== "skipped");
-        setMonthlyCompletedCount(payableLessons.length);
-        setMonthlyCompletedEarnings(payableLessons.reduce((total, lesson) => total + ((minutesFromTime(lesson.end) - minutesFromTime(lesson.time)) / 60) * lesson.rate, 0));
+        setMonthlyEarnings(summarizeLessonEarnings(monthOccurrences));
         const localRange = rangeForView(dateFromKey(availabilityWeekDate), "week");
         const localOccurrences: ScheduleOccurrence[] = [];
         for (let day = new Date(localRange.start); day < localRange.end; day = addDays(day, 1)) {
@@ -393,7 +416,7 @@ export default function Home() {
           localOccurrences.push(...dayLessons.map((lesson) => localLessonOccurrence(lesson, dateKey(day))));
         }
         setWeeklyOccurrences(localOccurrences);
-        setWeeklyLessonHours(lessonHours(localOccurrences));
+        setWeeklyLessonHours(teachingHoursInRange(localOccurrences, localRange));
         hasLoadedLessons.current = true;
         return;
       }
@@ -416,7 +439,7 @@ export default function Home() {
       const dayRange = rangeForView(dateFromKey(selectedDate), "day");
       const [profileResult, studentResult, canonicalMonth, canonicalWeek, dailyResult] = await Promise.all([
         database.getProfile(),
-        database.listStudents(true),
+        database.listStudents(),
         database.listEvents(monthRange),
         database.listEvents(weekRange),
         database.listEvents(dayRange),
@@ -428,6 +451,8 @@ export default function Home() {
       if (profileData?.default_lesson_rate !== null && profileData?.default_lesson_rate !== undefined) setDefaultLessonRate(Number(profileData.default_lesson_rate));
       if (profileData?.default_travel_minutes !== null && profileData?.default_travel_minutes !== undefined) setDefaultTravelMinutes(Number(profileData.default_travel_minutes));
       if (profileData?.default_lesson_tone) setDefaultLessonTone(profileData.default_lesson_tone as EventTone);
+      setDailyTeachingLimit(validTeachingHourLimit(profileData?.daily_stamina_limit, 16));
+      setWeeklyTeachingLimit(validTeachingHourLimit(profileData?.weekly_stamina_limit, 40));
       const { data: studentData, error: studentError } = studentResult;
       if (studentError) setDataError(studentError.message);
       if (studentData) setStudents(studentData.map((row) => ({ id: String(row.id), userId: String(row.user_id), name: String(row.name), email: String(row.email ?? ""), phone: String(row.phone ?? ""), notes: String(row.notes ?? ""), status: row.status === "archived" ? "archived" : "active" })));
@@ -442,13 +467,10 @@ export default function Home() {
         if (cancelled) return;
         if (monthExceptions.error) { setDataError(monthExceptions.error.message); return; }
         const monthOccurrences = expandEvents(monthEvents, (monthExceptions.data ?? []).map((row) => exceptionFromRow(row)), monthRange);
-        const payableLessons = monthOccurrences.filter((occurrence) => occurrence.kind === "lesson" && occurrence.status !== "cancelled" && occurrence.status !== "skipped");
-        setMonthlyCompletedCount(payableLessons.length);
-        setMonthlyCompletedEarnings(payableLessons.reduce((total, occurrence) => total + ((new Date(occurrence.endsAt).getTime() - new Date(occurrence.startsAt).getTime()) / 3600000) * occurrence.hourlyRate, 0));
+        setMonthlyEarnings(summarizeLessonEarnings(monthOccurrences, monthRange));
       } else {
         setDataError(canonicalMonth.error.message);
-        setMonthlyCompletedCount(0);
-        setMonthlyCompletedEarnings(0);
+        setMonthlyEarnings(emptyEarningsSummary);
       }
       const weekData = canonicalWeek.data;
       const weekError = canonicalWeek.error;
@@ -466,7 +488,7 @@ export default function Home() {
         }
         const expanded = expandEvents(scheduleEvents, exceptions, weekRange);
         setWeeklyOccurrences(expanded);
-        setWeeklyLessonHours(lessonHours(expanded));
+        setWeeklyLessonHours(teachingHoursInRange(expanded, weekRange));
       }
       const { data, error } = dailyResult;
 
@@ -490,6 +512,9 @@ export default function Home() {
     if (cloudConfigured && !userId) return;
     let cancelled = false;
     const loadAvailability = async () => {
+      setAvailabilityLoading(true);
+      setAvailabilityLoadedKey("");
+      setAvailabilityError("");
       let loadedDefault: WeeklyAvailability[] = [];
       let loadedOverrides: WeeklyAvailabilityByWeek = {};
       let loadedWorkingPlaces: WeeklyWorkingPlace[] = [];
@@ -540,30 +565,17 @@ export default function Home() {
           database.listWorkingPlaces(),
         ]);
         if (cancelled) return;
-        const { data, error } = availabilityResult;
-        if (error) {
-          loadLocalDefault();
-          if (!cancelled) setAvailabilityError("Cloud availability is not ready yet; local availability is being used.");
-        } else {
-          loadedDefault = (data ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), starts: String(row.starts).slice(0, 5), ends: String(row.ends).slice(0, 5) }));
+        if (availabilityResult.error || overrideResult.error || workingPlaceResult.error) {
+          setAvailabilityLoading(false);
+          setAvailabilityError("Your saved availability could not be loaded completely. Retry loading before editing or saving.");
+          return;
         }
-        const { data: overrideData, error: overrideError } = overrideResult;
-        if (overrideError) {
-          loadLocalOverrides();
-          if (!cancelled) setAvailabilityError("Week-specific availability is not ready yet; local week values are being used.");
-        } else {
-          loadedOverrides = Object.fromEntries((overrideData ?? []).flatMap((row) => {
-            const parsed = parseWeeklyAvailabilityOverride(row.intervals, String(row.week_start));
-            return parsed ? [[parsed.weekStart, { id: String(row.id), ...parsed }]] : [];
-          }));
-        }
-        const { data: workingPlaceData, error: workingPlaceError } = workingPlaceResult;
-        if (workingPlaceError) {
-          loadLocalWorkingPlaces();
-          if (!cancelled) setAvailabilityError("Cloud availability or workplaces are not ready yet; local values are being used.");
-        } else {
-          loadedWorkingPlaces = (workingPlaceData ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), place: String(row.place ?? "") }));
-        }
+        loadedDefault = (availabilityResult.data ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), starts: String(row.starts).slice(0, 5), ends: String(row.ends).slice(0, 5) }));
+        loadedOverrides = Object.fromEntries((overrideResult.data ?? []).flatMap((row) => {
+          const parsed = parseWeeklyAvailabilityOverride(row.intervals, String(row.week_start));
+          return parsed ? [[parsed.weekStart, { id: String(row.id), ...parsed }]] : [];
+        }));
+        loadedWorkingPlaces = (workingPlaceResult.data ?? []).map((row) => ({ id: String(row.id), weekday: Number(row.weekday), place: String(row.place ?? "") }));
       }
       if (!cancelled) {
         const normalizedDefault = normalizeWeeklyAvailability(loadedDefault);
@@ -578,11 +590,13 @@ export default function Home() {
         setAvailabilitySource(resolved.source);
         setWorkingPlaces(normalizedWorkingPlaces);
         setAvailabilityMessage(formatWeeklyAvailabilityMessage(resolved.intervals, normalizedWorkingPlaces));
+        setAvailabilityLoadedKey(availabilityLoadKey);
+        setAvailabilityLoading(false);
       }
     };
     void loadAvailability();
     return () => { cancelled = true; };
-  }, [availabilityEditMode, availabilityWeekDate, selectedAvailabilityWeekStart, userId]);
+  }, [availabilityEditMode, availabilityWeekDate, selectedAvailabilityWeekStart, userId, availabilityLoadKey]);
 
   useEffect(() => {
     if (hasLoadedLessons.current && !cloudConfigured) {
@@ -601,7 +615,7 @@ export default function Home() {
       const result = deleted ? await deleteGoogleCalendarEvent(event) : await syncGoogleCalendarEvent(event);
       if (result === "synced") showNotice("Google Calendar updated.");
     } catch (syncError) {
-      setDataError(`The schedule was saved, but Google Calendar sync failed: ${syncError instanceof Error ? syncError.message : "unknown error"}`);
+      setDataError(`The schedule was saved, but Google Calendar sync failed: ${googleCalendarErrorMessage(syncError)}`);
     }
   };
 
@@ -644,6 +658,7 @@ export default function Home() {
   };
 
   const moveAvailabilityWeek = (amount: number) => {
+    if (availabilitySaving) return;
     setAvailabilityWeekDate(dateKey(addDays(dateFromKey(selectedAvailabilityWeekStart), amount * 7)));
   };
 
@@ -652,6 +667,7 @@ export default function Home() {
   };
 
   const revertAvailabilityToDefault = async () => {
+    if (!availabilityReady || availabilitySaving) return;
     if (availabilityEditMode !== "week" || !availabilityOverrides[selectedAvailabilityWeekStart]) return;
     setAvailabilitySaving(true);
     setAvailabilityError("");
@@ -688,6 +704,10 @@ export default function Home() {
   };
 
   const saveAvailability = async () => {
+    if (!availabilityReady || availabilitySaving) {
+      if (!availabilityReady) setAvailabilityError("Load your saved availability completely before saving changes.");
+      return;
+    }
     const validationError = validateWeeklyAvailability(availability);
     if (validationError) {
       setAvailabilityError(validationError);
@@ -727,10 +747,7 @@ export default function Home() {
     const availabilityResult = await database.saveAvailability(availability, workingPlaceRows, availabilityEditMode === "default" ? undefined : selectedAvailabilityWeekStart);
     setAvailabilitySaving(false);
     if (availabilityResult.error) {
-      if (availabilityEditMode === "default") window.localStorage.setItem(weeklyAvailabilityStorageKey, JSON.stringify(availability));
-      else window.localStorage.setItem(weeklyAvailabilityOverrideStorageKey(selectedAvailabilityWeekStart), JSON.stringify(availability));
-      saveLocalWorkingPlaces();
-      setAvailabilityError("Cloud save failed: " + availabilityResult.error.message + " Your changes are retained in this browser; retry to sync them.");
+      setAvailabilityError("Cloud save failed: " + availabilityResult.error.message + " Your changes are still in this form; retry saving before leaving this page.");
       return;
     }
     if (availabilityEditMode === "default") setAvailabilityDefault(availability);
@@ -790,16 +807,15 @@ export default function Home() {
   };
 
   const changeDate = (offset: number) => {
-    const nextDate = new Date(`${selectedDate}T12:00:00`);
-    nextDate.setDate(nextDate.getDate() + offset);
+    const nextDate = addDays(dateFromKey(selectedDate), offset);
     hasLoadedLessons.current = false;
-    setSelectedDate(nextDate.toISOString().slice(0, 10));
+    setSelectedDate(dateKey(nextDate));
     setActiveNav("My calendar");
   };
 
   const goToToday = () => {
     hasLoadedLessons.current = false;
-    setSelectedDate(new Date().toISOString().slice(0, 10));
+    setSelectedDate(dateKey(new Date()));
     setActiveNav("My calendar");
   };
 
@@ -978,12 +994,12 @@ export default function Home() {
     router.refresh();
   };
 
-  const localLessonHours = lessons.filter((lesson) => lesson.kind === "lesson").reduce((total, lesson) => total + (minutesFromTime(lesson.end) - minutesFromTime(lesson.time)) / 60, 0);
-  const displayedWeeklyLessonHours = cloudConfigured ? weeklyLessonHours : localLessonHours;
-  const weeklyStamina = staminaState(displayedWeeklyLessonHours);
-  const weeklyStaminaMeter = Math.min(100, Math.round((displayedWeeklyLessonHours / 25) * 100));
-  const currentEarnings = monthlyCompletedEarnings;
-  const displayedCompletedCount = monthlyCompletedCount;
+  const displayedWeeklyLessonHours = weeklyLessonHours;
+  const dailyLessonHours = teachingHoursInRange(lessons.map(lesson => lesson.source ?? localLessonOccurrence(lesson, selectedDate)), rangeForView(dateFromKey(selectedDate), "day"));
+  const weeklyCapacity = teachingCapacity(displayedWeeklyLessonHours, weeklyTeachingLimit);
+  const dailyCapacity = teachingCapacity(dailyLessonHours, dailyTeachingLimit);
+  const studentChoices = students.filter(student => student.status === "active" || student.id === editingLesson?.studentId);
+  const currency = (amount: number) => `$${amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
   return (
     <main className="app-shell">
@@ -1044,18 +1060,28 @@ export default function Home() {
             <button className="primary-button" onClick={openNewLesson}><Plus size={17} /> Add to schedule</button>
           </section>
 
-          <section className="metric-grid" aria-label="Weekly summary">
+          <section className="metric-grid" aria-label="Schedule summary">
             <article className="metric-card metric-week">
               <div className="metric-top"><span className="metric-label">Weekly teaching</span><span className="metric-icon"><Clock3 size={16} /></span></div>
-              <div className="metric-value">{formatResult(displayedWeeklyLessonHours)}<span className="metric-unit"> hrs</span></div>
-              <div className={`meter meter-${weeklyStamina}`}><span style={{ width: `${weeklyStaminaMeter}%` }} /></div>
-              <div className="metric-bottom"><span>Stamina: {weeklyStamina}</span><span className="metric-note">{displayedWeeklyLessonHours > 25 ? "Over capacity" : "On track"}</span></div>
+              <div className="metric-value">{formatResult(displayedWeeklyLessonHours)}<span className="metric-unit"> / {formatResult(weeklyTeachingLimit)} hrs</span></div>
+              <div className={`meter meter-${weeklyCapacity.state}`}><span style={{ width: `${weeklyCapacity.percent}%` }} /></div>
+              <div className="metric-bottom"><span>Week of {dateFromKey(selectedAvailabilityWeekStart).toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span><span className="metric-note">{weeklyCapacity.overLimit ? "Over weekly limit" : "Within weekly limit"}</span></div>
+            </article>
+            <article className="metric-card metric-week">
+              <div className="metric-top"><span className="metric-label">Selected-day teaching</span><span className="metric-icon"><Clock3 size={16} /></span></div>
+              <div className="metric-value">{formatResult(dailyLessonHours)}<span className="metric-unit"> / {formatResult(dailyTeachingLimit)} hrs</span></div>
+              <div className={`meter meter-${dailyCapacity.state}`}><span style={{ width: `${dailyCapacity.percent}%` }} /></div>
+              <div className="metric-bottom"><span>{dateFromKey(selectedDate).toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span><span className="metric-note">{dailyCapacity.overLimit ? "Over daily limit" : "Within daily limit"}</span></div>
             </article>
             <article className="metric-card metric-earnings">
-              <div className="metric-top"><span className="metric-label">{new Date(`${selectedDate}T12:00:00`).toLocaleDateString("en-US", { month: "long" })} earnings</span><span className="metric-icon"><ArrowUpRight size={16} /></span></div>
-              <div className="metric-value currency">${currentEarnings.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-              <div className="metric-bottom"><span>{displayedCompletedCount} scheduled lessons</span><span className="trend-up">Live</span></div>
-              <div className="sparkline" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /></div>
+              <div className="metric-top"><span className="metric-label">{new Date(`${selectedDate}T12:00:00`).toLocaleDateString("en-US", { month: "long" })} expected earnings</span><span className="metric-icon"><ArrowUpRight size={16} /></span></div>
+              <div className="metric-value currency">{currency(monthlyEarnings.expected)}</div>
+              <div className="metric-bottom"><span>{monthlyEarnings.expectedCount} lessons · scheduled + completed</span></div>
+            </article>
+            <article className="metric-card metric-earnings">
+              <div className="metric-top"><span className="metric-label">{new Date(`${selectedDate}T12:00:00`).toLocaleDateString("en-US", { month: "long" })} completed earnings</span><span className="metric-icon"><ArrowUpRight size={16} /></span></div>
+              <div className="metric-value currency">{currency(monthlyEarnings.completed)}</div>
+              <div className="metric-bottom"><span>{monthlyEarnings.completedCount} completed lessons</span></div>
             </article>
           </section>
 
@@ -1089,18 +1115,22 @@ export default function Home() {
 
           </div>
           <section className="panel availability-panel" aria-labelledby="availability-title">
-            <div className="panel-heading availability-panel-heading"><div><p className="section-kicker">Client-ready rhythm</p><h2 id="availability-title">Weekly availability</h2></div><div className="availability-week-controls"><button type="button" className="round-button" aria-label="Previous availability week" title="Previous week" onClick={() => moveAvailabilityWeek(-1)}><ChevronLeft size={16} /></button><span><strong>{dateFromKey(selectedAvailabilityWeekStart).toLocaleDateString("en-US", { month: "short", day: "numeric" })}–{selectedAvailabilityWeekEnd.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</strong><small>{availabilityEditMode === "default" ? "Recurring default" : availabilitySource === "override" ? "Custom week" : "Using recurring default"}</small></span><button type="button" className="round-button" aria-label="Next availability week" title="Next week" onClick={() => moveAvailabilityWeek(1)}><ChevronRight size={16} /></button><button type="button" className="text-button" onClick={() => setAvailabilityWeekDate(scheduleDate)}>Current week</button><Clock3 size={20} className="panel-icon" /></div></div>
+            <div className="panel-heading availability-panel-heading"><div><p className="section-kicker">Client-ready rhythm</p><h2 id="availability-title">Weekly availability</h2></div><div className="availability-week-controls"><button type="button" className="round-button" aria-label="Previous availability week" title="Previous week" onClick={() => moveAvailabilityWeek(-1)}><ChevronLeft size={16} /></button><span><strong>{dateFromKey(selectedAvailabilityWeekStart).toLocaleDateString("en-US", { month: "short", day: "numeric" })}–{selectedAvailabilityWeekEnd.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</strong><small>{availabilityEditMode === "default" ? "Recurring default" : availabilitySource === "override" ? "Custom week" : "Using recurring default"}</small></span><button type="button" className="round-button" aria-label="Next availability week" title="Next week" onClick={() => moveAvailabilityWeek(1)}><ChevronRight size={16} /></button><button type="button" className="text-button" onClick={() => { if (!availabilitySaving) setAvailabilityWeekDate(dateKey(new Date())); }}>Current week</button><Clock3 size={20} className="panel-icon" /></div></div>
             <div className="availability-content">
               <p className="availability-intro">Set the Monday-Sunday teaching windows for the selected week. Untouched weeks use the recurring default.</p>
+              {availabilityLoading && <p role="status">Loading saved availability…</p>}
+              {!availabilityLoading && !availabilityReady && <button type="button" className="secondary-button" onClick={() => setAvailabilityLoadVersion(value => value + 1)}>Retry loading availability</button>}
+              <fieldset disabled={!availabilityReady || availabilitySaving} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
               <div className="availability-mode-bar"><span className={`availability-status availability-status-${availabilitySource}`}>{availabilityEditMode === "default" ? "Editing recurring default" : availabilitySource === "override" ? "Custom schedule for this week" : "Inherited from recurring default"}</span><div>{availabilityEditMode === "default" ? <button type="button" className="secondary-button" onClick={() => changeAvailabilityEditMode("week")}>Edit selected week</button> : <button type="button" className="secondary-button" onClick={() => changeAvailabilityEditMode("default")}>Edit recurring default</button>}{availabilityEditMode === "week" && availabilitySource === "override" && <button type="button" className="text-button" onClick={() => void revertAvailabilityToDefault()} disabled={availabilitySaving}>Revert to default</button>}</div></div>
               <div className="availability-days">{[1, 2, 3, 4, 5, 6, 0].map((weekday) => { const day = addDays(dateFromKey(selectedAvailabilityWeekStart), (weekday + 6) % 7); const dayKey = dateKey(day); const occupied = occupiedAvailabilityByWeekday(weeklyOccurrences).filter((item) => item.weekday === weekday && item.eventDate === dayKey); const freeSlots = practicalFreeSlots(weeklyOccurrences).filter((slot) => slot.weekday === weekday); return <div className="availability-day" key={weekday}><div className="availability-day-heading"><div><strong>{weekdayNames[weekday]}</strong><span className="availability-date">{day.toLocaleDateString("en-US", { month: "short", day: "numeric" })}</span></div><button type="button" className="text-button" onClick={() => addAvailabilityWindow(weekday)}><Plus size={13} /> Add window</button></div><label className="availability-place"><span>Working place</span><input aria-label={`${weekdayNames[weekday]} working place`} value={workingPlaces[weekday] ?? ""} onChange={(event) => updateWorkingPlace(weekday, event.target.value)} placeholder="e.g. CWB" maxLength={120} /></label><div className="availability-occupied">{occupied.length ? occupied.map((item) => <span key={`${item.startsAt}-${item.endsAt}-${item.eventDate}`}>{item.title} · {String(Math.floor(item.starts / 60)).padStart(2, "0")}:{String(item.starts % 60).padStart(2, "0")}–{String(Math.floor(item.ends / 60)).padStart(2, "0")}:{String(item.ends % 60).padStart(2, "0")}</span>) : <span>No scheduled blocks</span>}</div><div className="availability-free-heading">Free time · 08:00–20:00</div>{freeSlots.length ? freeSlots.map((slot) => <div className="availability-free-slot" key={`${slot.starts}-${slot.ends}`}><span>{slot.starts}–{slot.ends}</span><button type="button" className="text-button" onClick={() => addFreeAvailabilitySlot(slot)}><Plus size={13} /> Use</button></div>) : <p className="availability-no-free">No free time in this range.</p>}{availability.map((interval, index) => interval.weekday === weekday && <div className="availability-window" key={`${interval.weekday}-${index}`}><input aria-label={`${weekdayNames[weekday]} start`} type="time" value={interval.starts} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, starts: event.target.value } : item))} /><span>to</span><input aria-label={`${weekdayNames[weekday]} end`} type="time" value={interval.ends} onChange={(event) => updateAvailability(availability.map((item, itemIndex) => itemIndex === index ? { ...item, ends: event.target.value } : item))} /><button type="button" className="icon-button availability-remove" aria-label="Remove availability window" onClick={() => removeAvailabilityWindow(index)}><X size={14} /></button></div>)}</div>; })}</div>
               <div className="availability-month-heading"><div><span className="form-field-label">Month overview</span><strong>{selectedMonth.toLocaleDateString("en-US", { month: "long", year: "numeric" })}</strong></div><span>Week-specific projection</span></div>
               <div className="availability-month-grid">{monthOverviewDays.map((day) => { const weekday = day.getDay(); const dayIntervals = availabilityIntervalsForWeek(weekStartKey(day)).filter((interval) => interval.weekday === weekday); return <div className="availability-month-day" key={dateKey(day)}><div><span>{day.toLocaleDateString("en-US", { weekday: "short" })}</span><strong>{day.getDate()}</strong></div>{dayIntervals.length ? <p>{dayIntervals.map((interval) => `${interval.starts}–${interval.ends}`).join(", ")}</p> : <p className="availability-month-empty">No window</p>}{workingPlaces[weekday] && <small>{workingPlaces[weekday]}</small>}</div>; })}</div>
               {availabilityError && <p className="form-error" role="alert">{availabilityError}</p>}
               {availabilityConflictsError && <p className="availability-conflict" role="alert">{availabilityConflictsError} Remove or adjust the window before saving.</p>}
-              <div className="availability-actions"><button type="button" className="primary-button" onClick={() => void saveAvailability()} disabled={availabilitySaving || Boolean(validateWeeklyAvailability(availability)) || Boolean(availabilityConflictsError)}><Save size={15} /> {availabilitySaving ? "Saving..." : "Save availability"}</button></div>
+              <div className="availability-actions"><button type="button" className="primary-button" onClick={() => void saveAvailability()} disabled={!availabilityReady || availabilitySaving || Boolean(validateWeeklyAvailability(availability)) || Boolean(availabilityConflictsError)}><Save size={15} /> {availabilitySaving ? "Saving..." : "Save availability"}</button></div>
               <div className="availability-message-heading"><span className="form-field-label">Message to send</span><button type="button" className="secondary-button" onClick={() => void copyAvailabilityMessage()}><Copy size={14} /> Copy message</button></div>
               <textarea className="availability-message" value={availabilityMessage} onChange={(event) => setAvailabilityMessage(event.target.value)} rows={8} />
+              </fieldset>
             </div>
           </section>
         </div>
@@ -1109,7 +1139,7 @@ export default function Home() {
       {lessonDetailsOpen && editingLesson && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setLessonDetailsOpen(false); }}>
         <section className="lesson-modal event-details-modal" role="dialog" aria-modal="true" aria-labelledby="lesson-details-title">
           <div className="modal-heading"><div><p className="section-kicker">Schedule block</p><h2 id="lesson-details-title">{editingLesson.title}</h2><p className="calendar-subtitle">{new Date(`${lessonFormDate}T12:00:00`).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</p></div><button className="modal-close" aria-label="Close schedule details" onClick={() => setLessonDetailsOpen(false)}><X size={18} /></button></div>
-          <div className="event-detail-grid"><div><span>Time</span><strong>{editingLesson.time}–{editingLesson.end}</strong></div><div><span>Type</span><strong>{editingLesson.kind === "lesson" ? "Lesson" : "Personal"}</strong></div>{editingLesson.kind === "lesson" && <div><span>Student</span><strong>{students.find((student) => student.id === editingLesson.studentId)?.name ?? "No student linked"}</strong></div>}<div><span>Rate</span><strong>{editingLesson.kind === "lesson" ? `$${editingLesson.rate}/h` : "Not applicable"}</strong></div><div><span>Travel</span><strong>{editingLesson.travelMinutes} minutes</strong></div><div><span>Status</span><strong>{editingLesson.status}</strong></div>{editingLesson.detail && <div className="event-detail-wide"><span>Notes</span><strong>{editingLesson.detail}</strong></div>}</div>
+          <div className="event-detail-grid"><div><span>Time</span><strong>{editingLesson.time}–{editingLesson.end}</strong></div><div><span>Type</span><strong>{editingLesson.kind === "lesson" ? "Lesson" : "Personal"}</strong></div>{editingLesson.kind === "lesson" && <div><span>Student</span><strong>{students.find((student) => student.id === editingLesson.studentId)?.name ?? "No student linked"}</strong></div>}<div><span>Rate</span><strong>{editingLesson.kind === "lesson" ? lessonRateLabel(editingLesson) : "Not applicable"}</strong></div><div><span>Travel</span><strong>{editingLesson.travelMinutes} minutes</strong></div><div><span>Status</span><strong>{editingLesson.status}</strong></div>{editingLesson.detail && <div className="event-detail-wide"><span>Notes</span><strong>{editingLesson.detail}</strong></div>}</div>
           <div className="modal-footer">{editingLesson.source?.isRecurring ? <><p className="settings-help">This is a recurring event. Open My calendar to edit or delete one occurrence or the series.</p><span /><button type="button" className="primary-button" onClick={() => openLessonInCalendar(editingLesson)}><CalendarDays size={15} /> Open in My calendar</button></> : <><button type="button" className="delete-button" onClick={requestLessonDelete}>Delete block</button><span /><button type="button" className="secondary-button" onClick={() => { setLessonDetailsOpen(false); openLessonEditor(editingLesson); }}>Edit</button></>}</div>
         </section>
       </div>}
@@ -1131,9 +1161,10 @@ export default function Home() {
               <label className="form-field"><span>Ends</span><input type="time" value={editingLesson.end} onChange={(event) => setEditingLesson({ ...editingLesson, end: event.target.value })} /></label>
               <label className="form-field form-field-wide"><span>Notes</span><input value={editingLesson.detail} onChange={(event) => setEditingLesson({ ...editingLesson, detail: event.target.value })} placeholder="What is this block for?" /></label>
               <label className="form-field"><span>Type</span><select value={editingLesson.kind} onChange={(event) => { const kind = event.target.value as Lesson["kind"]; setEditingLesson({ ...editingLesson, kind, tone: kind === "lesson" ? defaultLessonTone : "teal", studentId: kind === "lesson" ? editingLesson.studentId : null }); }}><option value="lesson">Lesson</option><option value="personal">Personal</option></select></label>
-              <label className="form-field"><span>Student</span><select value={editingLesson.studentId ?? ""} disabled={editingLesson.kind === "personal"} onChange={(event) => setEditingLesson({ ...editingLesson, studentId: event.target.value || null })}><option value="">No student linked</option>{students.map((student) => <option value={student.id} key={student.id}>{student.name}</option>)}</select></label>
+              <label className="form-field"><span>Student</span><select value={editingLesson.studentId ?? ""} disabled={editingLesson.kind === "personal"} onChange={(event) => setEditingLesson({ ...editingLesson, studentId: event.target.value || null })}><option value="">No student linked</option>{studentChoices.map((student) => <option value={student.id} key={student.id}>{student.name}{student.status === "archived" ? " (archived)" : ""}</option>)}</select></label>
               <label className="form-field"><span>Travel minutes</span><input type="number" min="0" value={editingLesson.travelMinutes} onChange={(event) => setEditingLesson({ ...editingLesson, travelMinutes: Number(event.target.value) })} /></label>
               <label className="form-field"><span>Hourly rate</span><input type="number" min="0" step="0.5" value={editingLesson.rate} onChange={(event) => setEditingLesson({ ...editingLesson, rate: Number(event.target.value) })} /></label>
+              {(editingLesson.fixedFee ?? editingLesson.source?.fixedFee) != null && <p className="settings-help">This lesson uses {lessonRateLabel(editingLesson)}. Changing its hourly rate does not change that fee.</p>}
               <div className="tone-picker form-field-wide"><span className="form-field-label">Color</span><div>{eventTones.map((tone) => <button type="button" key={tone} aria-label={`Use ${tone} color`} className={`tone-swatch tone-${tone} ${editingLesson.tone === tone ? "tone-selected" : ""}`} onClick={() => setEditingLesson({ ...editingLesson, tone })}></button>)}</div></div>
               <label className="form-field"><span>Status</span><select value={editingLesson.status} onChange={(event) => setEditingLesson({ ...editingLesson, status: event.target.value as Lesson["status"] })}><option value="scheduled">Scheduled</option><option value="completed">Completed</option></select></label>
             </div>

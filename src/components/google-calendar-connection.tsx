@@ -8,12 +8,13 @@ import {
   connectGoogleCalendar,
   googleCalendarConfigured,
   googleCalendarConnectionChangedEvent,
+  googleCalendarErrorMessage,
   googleCalendarIsConnected,
   googleCalendarNeedsReconnect,
   googleCalendarTokenExpiresAt,
   prepareGoogleCalendar,
 } from "@/lib/google-calendar/client";
-import { syncSavedScheduleToGoogleCalendar } from "@/lib/google-calendar/sync";
+import { googleCalendarLastSync, googleCalendarSyncCompletedEvent, syncSavedScheduleToGoogleCalendar } from "@/lib/google-calendar/sync";
 
 type ConnectionStatus = "checking" | "connected" | "not-connected" | "reconnect-required" | "error";
 type ConnectionBusy = "connect" | "sync" | null;
@@ -24,6 +25,8 @@ type ConnectionContext = {
   busy: ConnectionBusy;
   error: string;
   notice: string;
+  lastSyncedAt: string | null;
+  syncPending: boolean;
   connectAndSync: () => Promise<void>;
   sync: () => Promise<void>;
   check: () => Promise<void>;
@@ -44,13 +47,20 @@ export function GoogleCalendarConnection({ userId, children }: { userId: string;
   const [busy, setBusy] = useState<ConnectionBusy>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
+  const [syncPending, setSyncPending] = useState(true);
   const mounted = useRef(false);
   const operation = useRef(0);
   const running = useRef(false);
   const syncedOnLogin = useRef(false);
+  const pendingCheck = useRef<{ sync: boolean } | null>(null);
 
-  const run = useCallback(async (action: "check" | "connect" | "sync", syncAfterCheck = false) => {
-    if (!configured || running.current) return;
+  const run = useCallback(async function perform(action: "check" | "connect" | "sync", syncAfterCheck = false) {
+    if (!configured) return;
+    if (running.current) {
+      if (action === "check") pendingCheck.current = { sync: Boolean(pendingCheck.current?.sync || syncAfterCheck) };
+      return;
+    }
     running.current = true;
     const current = ++operation.current;
     const active = () => mounted.current && operation.current === current;
@@ -88,18 +98,35 @@ export function GoogleCalendarConnection({ userId, children }: { userId: string;
         setStatus(googleCalendarNeedsReconnect(userId) ? "reconnect-required" : "not-connected");
         return;
       }
+      const completed = googleCalendarLastSync(userId);
+      if (!completed || completed.version !== window.localStorage.getItem("daylight-schedule-version")) {
+        syncedOnLogin.current = false;
+        setSyncPending(true);
+        setStatus("connected");
+        setNotice("Your latest saved changes are waiting to sync.");
+        pendingCheck.current = { sync: true };
+        return;
+      }
       syncedOnLogin.current = true;
+      setSyncPending(false);
+      setLastSyncedAt(completed.at);
       setStatus("connected");
       setNotice("Google Calendar is up to date with your saved schedule.");
     } catch (failure) {
       if (!active()) return;
+      if (action !== "check" || !syncedOnLogin.current) setSyncPending(true);
       syncedOnLogin.current = false;
       setStatus(googleCalendarNeedsReconnect(userId) ? "reconnect-required" : googleCalendarIsConnected(userId) ? "error" : "not-connected");
-      setError(failure instanceof Error ? failure.message : "Google Calendar could not be reached. Try again.");
+      setError(googleCalendarErrorMessage(failure));
     } finally {
       if (active()) {
         running.current = false;
         setBusy(null);
+        const pending = pendingCheck.current;
+        pendingCheck.current = null;
+        if (pending) queueMicrotask(() => {
+          if (active()) void perform("check", pending.sync);
+        });
       }
     }
   }, [configured, userId]);
@@ -115,33 +142,44 @@ export function GoogleCalendarConnection({ userId, children }: { userId: string;
     const recovered = () => { prepare(); void run("check", true); };
     const scheduleChanged = () => {
       syncedOnLogin.current = false;
+      setSyncPending(true);
       setNotice("");
+      if (running.current) pendingCheck.current = { sync: true };
+    };
+    const syncFinished = () => {
+      const saved = googleCalendarLastSync(userId);
+      setLastSyncedAt(saved?.at ?? null);
+      setSyncPending(!saved || saved.version !== window.localStorage.getItem("daylight-schedule-version"));
     };
     const changed = (event: StorageEvent) => {
       if (event.key === "daylight-schedule-version") scheduleChanged();
       if (event.key === "daylight-google-calendar-connection") refresh();
+      if (event.key === `daylight-google-calendar-last-sync-${userId}`) syncFinished();
     };
     prepare();
     const initialOperation = operation.current;
     queueMicrotask(() => {
-      if (mounted.current && operation.current === initialOperation) void run("check", true);
+      if (mounted.current && operation.current === initialOperation) { syncFinished(); void run("check", true); }
     });
     window.addEventListener("focus", refresh);
     window.addEventListener("online", recovered);
     window.addEventListener("storage", changed);
     window.addEventListener("daylight-schedule-changed", scheduleChanged);
     window.addEventListener(googleCalendarConnectionChangedEvent, refresh);
+    window.addEventListener(googleCalendarSyncCompletedEvent, syncFinished);
     return () => {
       mounted.current = false;
       operation.current += 1;
       running.current = false;
+      pendingCheck.current = null;
       window.removeEventListener("focus", refresh);
       window.removeEventListener("online", recovered);
       window.removeEventListener("storage", changed);
       window.removeEventListener("daylight-schedule-changed", scheduleChanged);
       window.removeEventListener(googleCalendarConnectionChangedEvent, refresh);
+      window.removeEventListener(googleCalendarSyncCompletedEvent, syncFinished);
     };
-  }, [run]);
+  }, [run, userId]);
 
   useEffect(() => {
     if (status !== "connected" || busy) return;
@@ -158,7 +196,7 @@ export function GoogleCalendarConnection({ userId, children }: { userId: string;
       : status === "not-connected" ? "Connect Google Calendar to sync your schedule."
         : "Google Calendar needs attention.";
 
-  return <GoogleCalendarContext.Provider value={{ userId, configured, status, busy, error, notice, connectAndSync, sync, check }}>
+  return <GoogleCalendarContext.Provider value={{ userId, configured, status, busy, error, notice, lastSyncedAt, syncPending, connectAndSync, sync, check }}>
     {showBanner && <aside className="google-connection-banner" aria-label="Google Calendar connection">
       <div className="google-connection-copy"><strong>{label}</strong>{error && <p role="alert">{error}</p>}</div>
       <div className="google-connection-actions">

@@ -57,11 +57,16 @@ const fixtureEvent = (overrides = {}) => ({
   recurrenceWeekdays: [], recurrenceUntil: null, studentId: null, ...overrides,
 });
 
-function calendarHarness({ event = fixtureEvent(), view = "week", date = "2026-11-03", profileTimezone = "UTC", phone = false } = {}) {
+function calendarHarness({ event = fixtureEvent(), view = "week", date = "2026-11-03", profileTimezone = "UTC", phone = false, exceptions = [], database: providedDatabase, runEffects = false, connection = {} } = {}) {
   const originalEvent = JSON.stringify(event);
   const databaseCalls = [];
-  const values = new Map(Object.entries({ events: [event], exceptions: [], userId: "user-1", profileTimezone, loading: false, chosenView: view }));
+  const values = new Map(Object.entries({ events: [event], exceptions, userId: "user-1", profileTimezone, loading: false, chosenView: view }));
   const stored = new Map();
+  const effects = [];
+  const pendingEffects = [];
+  const refs = [];
+  let effectIndex = 0;
+  let refIndex = 0;
   const window = {
     location: { search: `?date=${date}` },
     localStorage: { getItem: key => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, String(value)), removeItem: key => stored.delete(key) },
@@ -73,15 +78,28 @@ function calendarHarness({ event = fixtureEvent(), view = "week", date = "2026-1
     if (!values.has(name)) values.set(name, typeof initial === "function" ? initial() : initial);
     return [values.get(name), next => values.set(name, typeof next === "function" ? next(values.get(name)) : next)];
   };
-  const react = { ...React, useEffect() {}, useRef: initial => ({ current: initial }), useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot() };
-  const googleCalendar = { userId: "user-1", configured: true, status: "connected", busy: null, notice: "", error: "", connectAndSync: async () => {}, sync: async () => {}, check: async () => {} };
+  const react = {
+    ...React,
+    useEffect(callback, dependencies = []) {
+      if (!runEffects) return;
+      const index = effectIndex++;
+      const previous = effects[index];
+      if (!previous || dependencies.some((value, position) => !Object.is(value, previous.dependencies[position]))) pendingEffects.push(() => {
+        previous?.cleanup?.();
+        effects[index] = { dependencies, cleanup: callback() };
+      });
+    },
+    useRef: initial => { const index = refIndex++; return refs[index] ?? (refs[index] = { current: initial }); },
+    useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
+  };
+  const googleCalendar = { userId: "user-1", configured: true, status: "connected", busy: null, notice: "", error: "", lastSyncedAt: null, syncPending: false, connectAndSync: async () => {}, sync: async () => {}, check: async () => {}, ...connection };
   const mocks = {
     react,
     "react/jsx-runtime": jsxRuntime,
     "next/navigation": { useRouter: () => ({ push() {}, replace() {}, refresh() {} }) },
     "lucide-react": new Proxy({}, { get: (_object, name) => () => React.createElement("svg", { "data-icon": String(name) }) }),
     "@/components/google-calendar-connection": { useGoogleCalendarConnection: () => googleCalendar },
-    "@/lib/data/client": { cloudConfigured: true, database: new Proxy({}, { get: (_object, name) => (...args) => {
+    "@/lib/data/client": { cloudConfigured: true, database: providedDatabase ?? new Proxy({}, { get: (_object, name) => (...args) => {
       databaseCalls.push({ name, args });
       throw new Error(`Opening or displaying a calendar event must not call database.${String(name)}`);
     } }) },
@@ -128,6 +146,18 @@ function calendarHarness({ event = fixtureEvent(), view = "week", date = "2026-1
   }
   const Calendar = load(pageFile).default;
   const render = () => {
+    // Model a fully loaded event/exception snapshot for the displayed range.
+    const dates = load("src/lib/schedule/dates.ts");
+    const zones = load("src/lib/schedule/timezone.ts");
+    const display = load("src/lib/schedule/calendar-display.ts");
+    const mode = stored.get(display.calendarTimeZoneModeStorageKey("user-1")) === "saved" ? "saved" : "device";
+    const zone = display.resolveCalendarDisplayTimeZone(mode, Intl.DateTimeFormat().resolvedOptions().timeZone, profileTimezone);
+    const params = new URLSearchParams(window.location.search);
+    const anchor = params.get("event") && params.get("at") ? zones.dateKeyInTimeZone(params.get("at"), zone) : params.get("date") ?? date;
+    const range = dates.rangeForView(dates.dateFromKey(anchor), values.get("chosenView") ?? view, zone);
+    if (!runEffects || !values.has("scheduleSnapshotKey")) values.set("scheduleSnapshotKey", `${range.start.getTime()}:${range.end.getTime()}`);
+    effectIndex = 0;
+    refIndex = 0;
     const tree = Calendar();
     assert.equal(databaseCalls.length, 0, "Displaying and inspecting events must not write to the database");
     assert.equal(JSON.stringify(event), originalEvent, "Changing display timezone must preserve the saved instant");
@@ -139,7 +169,11 @@ function calendarHarness({ event = fixtureEvent(), view = "week", date = "2026-1
     card.props.onClick({ stopPropagation() {} });
     return render();
   };
-  return { render, clickCard, values, load, window };
+  const flush = async () => {
+    while (pendingEffects.length) pendingEffects.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+  };
+  return { render, clickCard, values, load, window, flush };
 }
 
 function detailTime(tree) {
@@ -147,6 +181,19 @@ function detailTime(tree) {
   const field = requireOne(children(grid).filter(node => children(node).some(child => child.type === "span" && /^Time(?:\s|$)/.test(textOf(child)))), "Time field");
   return textOf(requireOne(children(field).filter(node => node.type === "strong"), "detail time value"));
 }
+
+test("Calendar keeps the last successful sync visible while new changes are pending or syncing", () => {
+  for (const busy of [null, "sync"]) {
+    const view = calendarHarness({ connection: { syncPending: true, busy, lastSyncedAt: "2026-11-03T07:00:00.000Z" } });
+    const panel = requireOne(byClass(view.render(), "calendar-google-sync"), "Google Calendar panel");
+    const content = textOf(panel);
+    assert.match(content, /Connected/);
+    assert.match(content, busy ? /Syncing your saved schedule/ : /Saved changes are waiting to sync/);
+    assert.match(content, /Last successful full sync:/);
+    assert.match(content, /3:00 PM/);
+    assert.match(content, /Asia\/Hong_Kong/);
+  }
+});
 
 function chooseSavedTimezone(harness, tree) {
   const selector = requireOne(descendants(tree).filter(node => node.type === "select" && children(node).some(option => option.props.value === "device") && children(node).some(option => option.props.value === "saved")), "calendar timezone selector");
@@ -247,3 +294,93 @@ test("display timezone helpers keep preferences account-specific and fall back f
   assert.equal(display.resolveCalendarDisplayTimeZone("saved", "Asia/Hong_Kong", "invalid-zone"), "Asia/Hong_Kong");
   assert.equal(clockMinutes(display.formatCalendarTime(fixtureEvent().startsAt, "Asia/Hong_Kong")), 16 * 60 + 30);
 });
+
+test("phone day and week views show short lessons in a readable primary list with a collapsed optional grid", () => {
+  for (const view of ["day", "week"]) {
+    const event = fixtureEvent({ title: "A complete title for a short lesson", endsAt: "2026-11-03T08:45:00.000Z" });
+    const harness = calendarHarness({ event, view, phone: true });
+    const tree = harness.render();
+    const list = requireOne(byClass(tree, "calendar-compact-events"), `${view} primary event list`);
+    const card = requireOne(byClass(list, "calendar-agenda-event"), "readable short lesson");
+    assert.match(textOf(card), /A complete title for a short lesson/);
+    const time = requireOne(byClass(card, "calendar-agenda-time"), "complete event time");
+    assert.match(textOf(time), /4:30\s*PM–4:45\s*PM/);
+    const grid = requireOne(byClass(tree, "calendar-phone-time-grid"), "optional phone time grid");
+    assert.equal(grid.type, "details");
+    assert.equal(Boolean(grid.props.open), false);
+  }
+});
+
+test("an overnight event remains visible on the next day's clipped timeline", () => {
+  const harness = calendarHarness({ view: "day", date: "2026-11-04", event: fixtureEvent({ startsAt: "2026-11-03T13:30:00.000Z", endsAt: "2026-11-04T00:00:00.000Z" }) });
+  const tree = harness.render();
+  const card = requireOne(byClass(tree, "calendar-event"), "overnight carry-over event");
+  assert.equal(Number.parseFloat(card.props.style.top), 0);
+  assert.ok(Math.abs(Number.parseFloat(card.props.style.height) - 100 / 15) < 0.001, "Only the current day's visible 07:00–08:00 portion occupies the grid");
+});
+
+test("Calendar details label a zero fixed fee correctly and its editor can mark a lesson completed", () => {
+  const harness = calendarHarness({ event: fixtureEvent({ fixedFee: 0, hourlyRate: 999 }) });
+  let tree = harness.clickCard(harness.render());
+  const details = requireOne(byClass(tree, "event-details-modal"), "lesson details");
+  assert.match(textOf(details), /\$0 fixed/);
+  assert.doesNotMatch(textOf(details), /\$999\/h/);
+  requireOne(descendants(details).filter(node => node.type === "button" && textOf(node) === "Edit"), "Edit button").props.onClick();
+  tree = harness.render();
+  const editor = requireOne(byClass(tree, "calendar-editor"), "lesson editor");
+  const status = requireOne(descendants(editor).filter(node => node.type === "select" && children(node).some(option => option.props.value === "completed")), "lesson status selector");
+  assert.equal(status.props.value, "scheduled");
+  status.props.onChange({ target: { value: "completed" } });
+  assert.equal(harness.values.get("form").status, "completed");
+});
+
+for (const kind of ["cancelled", "moved"]) {
+  test(`failed occurrence refresh keeps a ${kind} lesson's last complete snapshot and blocks editing until retry`, async () => {
+    const event = fixtureEvent({ recurrenceWeekdays: [2] });
+    const originalStartsAt = event.startsAt;
+    const exception = {
+      id: "exception", eventId: event.id, originalStartsAt,
+      startsAt: kind === "moved" ? "2026-11-03T10:00:00.000Z" : null,
+      endsAt: kind === "moved" ? "2026-11-03T11:00:00.000Z" : null,
+      status: kind === "cancelled" ? "cancelled" : "scheduled", title: null, detail: null, kind: null, tone: null,
+      travelMinutes: null, hourlyRate: null, fixedFee: null,
+    };
+    let failing = true;
+    const writes = [];
+    const success = data => ({ data, error: null });
+    const database = {
+      getProfile: async () => success({ timezone: "UTC" }), listStudents: async () => success([]), listWorkingPlaces: async () => success([]),
+      listEvents: async () => success([{ id: event.id, starts_at: event.startsAt, ends_at: event.endsAt, timezone: "UTC", title: "Fresh canonical lesson", kind: "lesson", recurrence_weekdays: [2], status: "scheduled" }]),
+      listExceptions: async () => failing ? { data: null, error: new Error("Network unavailable") } : success([{ id: exception.id, event_id: event.id, original_starts_at: originalStartsAt, starts_at: exception.startsAt, ends_at: exception.endsAt, status: exception.status }]),
+      saveEvent: async (...args) => { writes.push(args); return success(null); },
+    };
+    const harness = calendarHarness({ event, view: "day", exceptions: [exception], database, runEffects: true });
+    harness.render();
+    await harness.flush();
+    let tree = harness.render();
+    assert.match(textOf(tree), /Occurrence changes could not be refreshed/);
+    assert.equal(harness.values.get("events")[0].title, event.title, "Do not publish series without their exception snapshot");
+    assert.equal(harness.values.get("exceptions")[0].status, exception.status);
+    const cards = byClass(tree, "calendar-event");
+    if (kind === "cancelled") assert.equal(cards.length, 0, "A cancelled lesson must not reappear as its base series slot");
+    else assert.equal(clockMinutes(textOf(requireOne(cards, "last known moved lesson"))), 18 * 60);
+    const add = requireOne(descendants(tree).filter(node => node.type === "button" && textOf(node).trim() === "Add event"), "Add event button");
+    assert.equal(add.props.disabled, true);
+    add.props.onClick();
+    tree = harness.render();
+    assert.equal(byClass(tree, "calendar-editor").length, 0);
+    assert.deepEqual(writes, []);
+    failing = false;
+    const retry = requireOne(descendants(tree).filter(node => node.type === "button" && textOf(node).trim() === "Retry loading calendar"), "retry button");
+    retry.props.onClick();
+    harness.render();
+    await harness.flush();
+    tree = harness.render();
+    assert.equal(harness.values.get("scheduleLoadError"), "");
+    assert.equal(harness.values.get("events")[0].title, "Fresh canonical lesson");
+    assert.equal(requireOne(descendants(tree).filter(node => node.type === "button" && textOf(node).trim() === "Add event"), "recovered Add event button").props.disabled, false);
+    if (kind === "cancelled") assert.equal(byClass(tree, "calendar-event").length, 0);
+    else assert.equal(clockMinutes(textOf(requireOne(byClass(tree, "calendar-event"), "recovered moved lesson"))), 18 * 60);
+    assert.deepEqual(writes, []);
+  });
+}

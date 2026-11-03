@@ -158,3 +158,35 @@ test("deletion commits parent and exceptions together or preserves both", async 
   assert.equal(success.error, null);
   assert.equal(records.size, 0);
 });
+
+test("reverting weekly availability preserves the override and its windows on network failure", async () => {
+  const { database, records, state } = memoryDatabase();
+  const week = "2026-11-02";
+  const marker = schema.normalizeRecord("availabilityOverrides", { week_start: week }, "user");
+  const window = schema.normalizeRecord("overrideIntervals", { week_start: week, weekday: 2, starts: "10:00", ends: "11:00" }, "user");
+  records.set(`users/user/availabilityOverrides/${marker.id}`, marker);
+  records.set(`users/user/overrideIntervals/${window.id}`, window);
+  state.failCommit = true;
+  const reverted = await database.deleteAvailabilityOverride(week);
+  assert.match(reverted.error?.message ?? "", /Network lost/);
+  assert.deepEqual(records.get(`users/user/availabilityOverrides/${marker.id}`), marker);
+  assert.deepEqual(records.get(`users/user/overrideIntervals/${window.id}`), window);
+});
+
+test("reverting availability removes the complete selected override without changing other weeks", async () => {
+  const { database, records } = memoryDatabase();
+  const selected = "2026-11-02";
+  const other = "2026-11-09";
+  for (const week of [selected, other]) {
+    const marker = schema.normalizeRecord("availabilityOverrides", { week_start: week }, "user");
+    const window = schema.normalizeRecord("overrideIntervals", { week_start: week, weekday: 2, starts: "10:00", ends: "11:00" }, "user");
+    records.set(`users/user/availabilityOverrides/${marker.id}`, marker);
+    records.set(`users/user/overrideIntervals/${window.id}`, window);
+  }
+  const reverted = await database.deleteAvailabilityOverride(selected);
+  assert.equal(reverted.error, null);
+  assert.equal(records.has(`users/user/availabilityOverrides/${selected}`), false);
+  assert.equal([...records.values()].some(row => row.week_start === selected), false);
+  assert.equal(records.has(`users/user/availabilityOverrides/${other}`), true);
+  assert.equal([...records.values()].filter(row => row.week_start === other).length, 2);
+});

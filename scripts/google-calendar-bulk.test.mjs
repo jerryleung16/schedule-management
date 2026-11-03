@@ -9,7 +9,7 @@ function load(path, globals = {}, imports = {}) {
   const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } });
   const evaluatedModule = { exports: {} };
   vm.runInNewContext(compiled.outputText, {
-    module: evaluatedModule, exports: evaluatedModule.exports, Date, Intl, crypto,
+    module: evaluatedModule, exports: evaluatedModule.exports, Date, Intl, crypto, Event,
     require: (name) => { assert.ok(Object.hasOwn(imports, name), name); return imports[name]; },
     ...globals,
   }, { filename: path });
@@ -27,11 +27,13 @@ function setup(onUpsert = () => {}) {
   const remote = new Map();
   const writes = [];
   let reads = 0;
+  let overrideReads = 0;
   const state = {
-    remote, writes,
+    remote, writes, local,
     setRows: (next) => { rows = next; },
     changed: () => local.set("daylight-schedule-version", crypto.randomUUID()),
     reads: () => reads,
+    overrideReads: () => overrideReads,
   };
   const client = {
     googleCalendarIsConnected: () => true,
@@ -44,6 +46,7 @@ function setup(onUpsert = () => {}) {
       return "synced";
     },
     reconcileGoogleCalendarOccurrences: async () => {},
+    loadGoogleCalendarOverrides: async () => { overrideReads += 1; return []; },
     syncGoogleCalendarOccurrence: async () => "synced",
     retryGoogleCalendarDeletions: async (_user, activeIds, candidates) => {
       let removed = 0;
@@ -51,7 +54,7 @@ function setup(onUpsert = () => {}) {
       return removed;
     },
   };
-  const syncModule = load("src/lib/google-calendar/sync.ts", { window: { localStorage: { getItem: (key) => local.get(key) ?? null } } }, {
+  const syncModule = load("src/lib/google-calendar/sync.ts", { window: { localStorage: { getItem: (key) => local.get(key) ?? null, setItem: (key, value) => local.set(key, value) }, dispatchEvent: () => {} } }, {
     "@/lib/data/client": { cloudConfigured: true, database: {
       listEvents: async () => { reads += 1; return { data: rows, error: null }; },
       listExceptions: async () => ({ data: [], error: null }),
@@ -60,7 +63,7 @@ function setup(onUpsert = () => {}) {
     "@/lib/schedule/recurrence": { isOriginalOccurrence: () => true },
     "./client": client,
   });
-  return { ...state, sync: syncModule.syncSavedScheduleToGoogleCalendar };
+  return { ...state, sync: syncModule.syncSavedScheduleToGoogleCalendar, lastSync: () => syncModule.googleCalendarLastSync("teacher") };
 }
 
 test("an edit made while a slow replay is in flight wins over the old snapshot", async () => {
@@ -114,4 +117,27 @@ test("two simultaneous full-sync requests for one user share a single replay", a
   assert.equal(first, second);
   await first;
   assert.equal(state.writes.length, 1);
+});
+
+test("a completed sync records its verified version and a failure never advances the timestamp", async () => {
+  let fail = false;
+  const state = setup(() => { if (fail) throw new Error("Google unavailable"); });
+  assert.equal(state.lastSync(), null);
+  state.changed();
+  await state.sync("teacher");
+  const completed = state.lastSync();
+  assert.ok(Number.isFinite(Date.parse(completed.at)));
+  assert.equal(completed.version, state.local.get("daylight-schedule-version"));
+  fail = true;
+  state.changed();
+  await assert.rejects(state.sync("teacher"), /Google unavailable/);
+  assert.deepEqual(state.lastSync(), completed);
+  assert.notEqual(state.lastSync().version, state.local.get("daylight-schedule-version"));
+});
+
+test("all recurring parents share one Google override scan per replay", async () => {
+  const state = setup();
+  state.setRows([{ ...event(), recurrence_weekdays: [2] }, { ...event("Another series"), id: "another", recurrence_weekdays: [2] }]);
+  await state.sync("teacher");
+  assert.equal(state.overrideReads(), 1);
 });

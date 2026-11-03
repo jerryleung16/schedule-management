@@ -59,6 +59,12 @@ My calendar opens in Day view on phones, with a daily agenda, touch-friendly con
 
 Full sync verifies that the saved schedule has not changed before reporting success and restarts when edits occur during replay. Google event IDs are stable to prevent simultaneous requests from creating duplicates. Daylight-owned events carry a workspace marker so missed deletions can be recovered on another browser; older unmarked events use browser links until they have been synced again.
 
+Temporary Google timeouts, rate limits, and service failures receive bounded retries. My calendar distinguishes pending changes from a verified connection and shows the last successful full sync. Deletion cleanup removes every Google copy carrying the deleted event's workspace ownership marker; unrelated calendar entries are preserved.
+
+Availability editing waits for a complete cloud read. A failed read keeps the last loaded values read-only until retry succeeds, rather than falling back to browser values that could overwrite newer data. Reverting a custom week removes its marker and intervals in one transaction.
+
+Calendar saves check the complete saved schedule, including target dates outside the current view, recurring dates, and moved occurrences. Bounded series are checked through their end date. Open-ended comparisons use a periodic proof where timezone offsets are known to remain fixed; when indefinite comparison cannot be verified safely, the form asks for a Repeat until date. This preflight check does not serialize simultaneous writes from separate devices.
+
 ## Validate
 
 ```bash
@@ -67,7 +73,9 @@ npm run build
 npm test
 ```
 
-The calendar displays your device's timezone by default. Its Timezone control can explicitly select the saved profile timezone instead; grid positions, labels, details, and date boundaries always use the selected display timezone. Existing events retain their stored instants and recurrence timezone, which is labelled when editing. Weekly expansion keeps event series separate from occurrence exceptions. Scheduled events do not count toward actual earnings; completed lesson events use hourly duration multiplied by rate, while skipped and cancelled events are excluded.
+The calendar displays your device's timezone by default. Its Timezone control can explicitly select the saved profile timezone instead; grid positions, labels, details, and date boundaries always use the selected display timezone. Existing events retain their stored instants and recurrence timezone, which is labelled when editing. Weekly expansion keeps event series separate from occurrence exceptions.
+
+Expected earnings include scheduled and completed lessons; completed earnings include completed lessons only. A fixed fee overrides the hourly calculation, including a zero fee. Each lesson's full fee belongs to its start month, preventing double counting across month boundaries. Skipped and cancelled lessons are excluded. Daily and weekly workload limits are teaching hours, shown against the saved Settings values; preparation, travel, and intensity do not change those units.
 
 ## Deploy to GitHub Pages
 

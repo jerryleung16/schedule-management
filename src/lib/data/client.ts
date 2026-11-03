@@ -167,14 +167,18 @@ export const database = {
   }),
   listWorkingPlaces: () => result(async () => (await list("workingPlaces")).sort((left, right) => left.weekday - right.weekday)),
   deleteAvailabilityOverride: (weekStart: string) => result(async () => {
-    await remove("availabilityOverrides", weekStart);
     const { store, uid } = await context();
+    const reference = doc(store, "users", uid, "availabilityOverrides", safeId(weekStart));
+    const initial = await getDocFromServer(reference);
     const intervals = await list("overrideIntervals", [where("week_start", "==", weekStart)]);
-    for (let offset = 0; offset < intervals.length; offset += 400) {
-      const batch = writeBatch(store);
-      intervals.slice(offset, offset + 400).forEach(interval => batch.delete(doc(store, "users", uid, "overrideIntervals", interval.id)));
-      await batch.commit();
-    }
+    if (intervals.length > 499) throw new Error("This week has too many availability windows to revert in one operation. Your saved availability has not changed.");
+    await runTransaction(store, async transaction => {
+      const saved = await transaction.get(reference);
+      const snapshots = await Promise.all(intervals.map(row => transaction.get(doc(store, "users", uid, "overrideIntervals", row.id))));
+      if (!sameRecord(saved.data(), initial.data()) || snapshots.some((snapshot, index) => !sameRecord(snapshot.data(), intervals[index]))) throw new Error("This week's availability changed while reverting. Reload and try again.");
+      transaction.delete(reference);
+      intervals.forEach(row => transaction.delete(doc(store, "users", uid, "overrideIntervals", row.id)));
+    });
   }),
   saveAvailability: (intervals: { weekday: number; starts: string; ends: string }[], places: { weekday: number; place: string }[], weekStart?: string) => result(async () => {
     const { store, uid } = await context();

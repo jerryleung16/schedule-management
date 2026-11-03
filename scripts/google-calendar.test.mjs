@@ -52,6 +52,8 @@ function browser() {
     dispatchEvent: events.dispatchEvent.bind(events),
     addEventListener: events.addEventListener.bind(events),
     removeEventListener: events.removeEventListener.bind(events),
+    setTimeout: (callback, delay) => setTimeout(callback, Math.min(delay, 1)),
+    clearTimeout,
     google: { accounts: { oauth2: {
       initTokenClient: ({ callback }) => ({
         requestAccessToken: () => callback({ access_token: "renewed-token", expires_in: 3600 }),
@@ -75,6 +77,7 @@ function calendarServer() {
   const events = new Map();
   const calls = [];
   let failNext = null;
+  let failuresRemaining = 0;
   let sequence = 0;
   const fetch = async (url, init = {}) => {
     const request = { url: new URL(url), method: init.method ?? "GET", body: init.body ? JSON.parse(init.body) : null };
@@ -82,7 +85,8 @@ function calendarServer() {
     if (failNext) {
       const fail = failNext(request);
       if (fail) {
-        failNext = null;
+        failuresRemaining -= 1;
+        if (!failuresRemaining) failNext = null;
         if (fail instanceof Error) throw fail;
         return fail;
       }
@@ -105,7 +109,7 @@ function calendarServer() {
     if (request.method === "PATCH") events.set(id, { ...events.get(id), ...request.body });
     return response(200, events.get(id));
   };
-  return { events, calls, fetch, failOnce: (callback) => { failNext = callback; } };
+  return { events, calls, fetch, failOnce: (callback) => { failNext = callback; failuresRemaining = 1; }, failTimes: (callback, count = 3) => { failNext = callback; failuresRemaining = count; } };
 }
 
 function loadClient(window, fetch, document) {
@@ -170,10 +174,10 @@ for (const status of [401, 403]) {
 test("failed login verification reports network and server failures instead of a connected state", async () => {
   const window = browser();
   const offlineClient = loadClient(window, async () => { throw new Error("Network unavailable"); });
-  await assert.rejects(offlineClient.checkGoogleCalendarConnection(userId), /Network unavailable/);
+  await assert.rejects(offlineClient.checkGoogleCalendarConnection(userId), /could not be reached.*schedule is saved/i);
   assert.ok(offlineClient.googleCalendarTokenExpiresAt(userId), "A network failure must not discard usable authorization");
   const unavailableClient = loadClient(window, async () => response(503, { error: { message: "Calendar service unavailable" } }));
-  await assert.rejects(unavailableClient.checkGoogleCalendarConnection(userId), /Calendar service unavailable/);
+  await assert.rejects(unavailableClient.checkGoogleCalendarConnection(userId), /temporarily busy.*schedule is saved/i);
   assert.ok(unavailableClient.googleCalendarTokenExpiresAt(userId));
 });
 
@@ -227,7 +231,7 @@ for (const reason of ["rateLimitExceeded", "userRateLimitExceeded", "quotaExceed
     const window = browser();
     const client = loadClient(window, async () => response(403, { error: { message: reason, errors: [{ reason }] } }));
     const stored = window.sessionStorage.getItem(tokenKey);
-    await assert.rejects(client.checkGoogleCalendarConnection(userId), new RegExp(reason));
+    await assert.rejects(client.checkGoogleCalendarConnection(userId), /rateLimit/.test(reason) || /RateLimit/.test(reason) ? /temporarily busy/i : new RegExp(reason));
     assert.equal(window.sessionStorage.getItem(tokenKey), stored);
     assert.equal(client.googleCalendarIsConnected(userId), true);
   });
@@ -340,7 +344,7 @@ test("a lost insert response remains idempotent while the property search is sta
     if (init.method === "POST" && !lost) { lost = true; throw new Error("Lost response"); }
     return result;
   });
-  await assert.rejects(client.syncGoogleCalendarEvent(event()), /Lost response/);
+  await client.syncGoogleCalendarEvent(event());
   await client.syncGoogleCalendarEvent(event());
   assert.equal(server.events.size, 1);
   assert.equal(server.calls.filter((call) => call.method === "POST").length, 2);
@@ -382,10 +386,10 @@ test("retry finds an event after Google saved it but the response was lost", asy
     if (init?.method === "POST" && loseResponse) { loseResponse = false; throw new Error("Network lost"); }
     return result;
   });
-  await assert.rejects(client.syncGoogleCalendarEvent(event()), /Network lost/);
+  await client.syncGoogleCalendarEvent(event());
   await client.syncGoogleCalendarEvent(event());
   assert.equal(server.events.size, 1);
-  assert.equal(server.calls.filter((call) => call.method === "POST").length, 1);
+  assert.equal(server.calls.filter((call) => call.method === "POST").length, 2);
 });
 
 test("temporary HTTP errors preserve event links and do not create replacements", async () => {
@@ -394,10 +398,147 @@ test("temporary HTTP errors preserve event links and do not create replacements"
   const client = loadClient(window, server.fetch);
   await client.syncGoogleCalendarEvent(event());
   const linked = window.localStorage.getItem(linksKey);
-  server.failOnce(() => response(503, { error: { message: "Temporarily unavailable" } }));
-  await assert.rejects(client.syncGoogleCalendarEvent(event()), /Temporarily unavailable/);
+  server.failTimes(() => response(503, { error: { message: "Temporarily unavailable" } }));
+  await assert.rejects(client.syncGoogleCalendarEvent(event()), /temporarily busy/i);
   assert.equal(window.localStorage.getItem(linksKey), linked);
   assert.equal(server.calls.filter((call) => call.method === "POST").length, 1);
+});
+
+test("temporary Google failures recover with bounded backoff and retain authorization", async () => {
+  const window = browser();
+  const delays = [];
+  window.setTimeout = (callback, delay) => { delays.push(delay); queueMicrotask(callback); return 0; };
+  let calls = 0;
+  const client = loadClient(window, async () => {
+    calls += 1;
+    return calls === 1 ? response(503) : response(200, { items: [] });
+  });
+  assert.equal(await client.checkGoogleCalendarConnection(userId), "connected");
+  assert.equal(calls, 2);
+  assert.equal(delays.length, 1);
+  assert.ok(delays[0] >= 400 && delays[0] < 550);
+  assert.ok(client.googleCalendarIsConnected(userId));
+});
+
+test("Google Retry-After is respected and a long delay does not create an unbounded wait", async () => {
+  for (const [seconds, expectedCalls] of [[2, 2], [120, 1]]) {
+    const window = browser();
+    const delays = [];
+    window.setTimeout = (callback, delay) => { delays.push(delay); queueMicrotask(callback); return 0; };
+    let calls = 0;
+    const client = loadClient(window, async () => {
+      calls += 1;
+      return calls === 1 ? { ...response(429), headers: { get: () => String(seconds) } } : response(200, { items: [] });
+    });
+    if (seconds === 2) {
+      assert.equal(await client.checkGoogleCalendarConnection(userId), "connected");
+      assert.deepEqual(delays, [2000]);
+    } else {
+      await assert.rejects(client.checkGoogleCalendarConnection(userId), /temporarily busy.*schedule is saved/i);
+      assert.deepEqual(delays, []);
+    }
+    assert.equal(calls, expectedCalls);
+  }
+});
+
+test("aborted or timed-out fetches get a friendly error after three attempts without losing the token", async () => {
+  const window = browser();
+  let calls = 0;
+  const client = loadClient(window, async () => { calls += 1; throw Object.assign(new Error("Fetch aborted"), { name: "AbortError" }); });
+  await assert.rejects(client.checkGoogleCalendarConnection(userId), /did not respond in time.*schedule is saved/i);
+  assert.equal(calls, 3);
+  assert.ok(client.googleCalendarIsConnected(userId));
+  assert.doesNotMatch(client.googleCalendarErrorMessage(Object.assign(new Error("Fetch aborted"), { name: "AbortError" })), /Fetch aborted/);
+});
+
+test("a canonical edit during backoff prevents retrying an obsolete Google write", async () => {
+  const window = browser();
+  const server = calendarServer();
+  let client = loadClient(window, server.fetch);
+  await client.syncGoogleCalendarEvent(event());
+  let writes = 0;
+  window.setTimeout = (callback) => { window.localStorage.setItem("daylight-schedule-version", "new-edit"); queueMicrotask(callback); return 0; };
+  client = loadClient(window, async (url, init) => {
+    if (init?.method === "PATCH") { writes += 1; throw new Error("Network lost"); }
+    return server.fetch(url, init);
+  });
+  await assert.rejects(client.syncGoogleCalendarEvent({ ...event(), title: "Old edit" }), /schedule changed.*saved.*sync again/i);
+  assert.equal(writes, 1);
+});
+
+test("a lost DELETE response is retried safely even if Google already removed the event", async () => {
+  const window = browser();
+  const server = calendarServer();
+  let lost = false;
+  const client = loadClient(window, async (url, init) => {
+    const result = await server.fetch(url, init);
+    if (init?.method === "DELETE" && !lost) { lost = true; throw new Error("Response lost"); }
+    return result;
+  });
+  await client.syncGoogleCalendarEvent(event());
+  assert.equal(await client.deleteGoogleCalendarEvent(event()), "synced");
+  assert.equal(server.events.size, 0);
+  assert.equal(server.calls.filter(call => call.method === "DELETE").length, 2);
+  assert.equal(await client.retryGoogleCalendarDeletions(userId, []), 0);
+});
+
+test("deletion removes every older owned duplicate while preserving other owners and unrelated events", async () => {
+  const window = browser();
+  const server = calendarServer();
+  const client = loadClient(window, server.fetch);
+  await client.syncGoogleCalendarEvent(event());
+  const copy = [...server.events.values()][0];
+  server.events.set("legacy-copy", { ...copy, id: "legacy-copy", extendedProperties: { private: { daylightEventId: event().id } } });
+  server.events.set("owned-copy", { ...copy, id: "owned-copy" });
+  server.events.set("other-owner", { ...copy, id: "other-owner", extendedProperties: { private: { daylightEventId: event().id, daylightUserId: "other-user" } } });
+  server.events.set("unrelated", { id: "unrelated", summary: "Appointment" });
+  server.events.set("instance", { ...copy, id: "instance", recurringEventId: copy.id, originalStartTime: { dateTime: event().startsAt } });
+  const candidates = await client.googleCalendarRemoteDeletionCandidates(userId);
+  assert.equal(await client.retryGoogleCalendarDeletions(userId, [], candidates), 1);
+  assert.deepEqual([...server.events.keys()].sort(), ["instance", "other-owner", "unrelated"]);
+  assert.equal(server.calls.filter(call => call.method === "DELETE").length, 3);
+});
+
+test("a partial duplicate cleanup stays pending and finishes after a reload", async () => {
+  const window = browser();
+  const server = calendarServer();
+  const client = loadClient(window, server.fetch);
+  await client.syncGoogleCalendarEvent(event());
+  const copy = [...server.events.values()][0];
+  server.events.set("older-copy", { ...copy, id: "older-copy" });
+  server.failTimes(call => call.method === "DELETE" && call.url.pathname.endsWith("/older-copy") ? new Error("Network lost") : null);
+  await assert.rejects(client.deleteGoogleCalendarEvent(event()), /could not be reached/i);
+  assert.equal(server.events.size, 1);
+  const reloaded = loadClient(window, server.fetch);
+  assert.equal(await reloaded.retryGoogleCalendarDeletions(userId, []), 1);
+  assert.equal(server.events.size, 0);
+});
+
+test("deletion keeps a verified cached link when Google's property search is stale", async () => {
+  const window = browser();
+  const server = calendarServer();
+  const initial = loadClient(window, server.fetch);
+  await initial.syncGoogleCalendarEvent(event());
+  const id = [...server.events.keys()][0];
+  const client = loadClient(window, async (url, init = {}) => {
+    if (!init.method && new URL(url).pathname.endsWith("/events")) return response(200, { items: [] });
+    return server.fetch(url, init);
+  });
+  assert.equal(await client.deleteGoogleCalendarEvent(event()), "synced");
+  assert.equal(server.events.size, 0);
+  assert.ok(server.calls.some(call => call.method === "DELETE" && call.url.pathname.endsWith(`/${id}`)));
+  assert.equal(await client.retryGoogleCalendarDeletions(userId, []), 0);
+});
+
+test("a cached link to another owner's resource is excluded from duplicate cleanup", async () => {
+  const window = browser();
+  const server = calendarServer();
+  server.events.set("foreign", { id: "foreign", extendedProperties: { private: { daylightEventId: event().id, daylightUserId: "someone-else" } } });
+  window.localStorage.setItem(linksKey, JSON.stringify({ [event().id]: "foreign" }));
+  const client = loadClient(window, server.fetch);
+  await client.deleteGoogleCalendarEvent(event());
+  assert.ok(server.events.has("foreign"));
+  assert.equal(server.calls.some(call => call.method === "DELETE"), false);
 });
 
 test("event lookup skips instances and cancelled records across empty result pages", async () => {
@@ -625,8 +766,8 @@ test("failed deletion remains retryable after a page reload", async () => {
   const server = calendarServer();
   const firstClient = loadClient(window, server.fetch);
   await firstClient.syncGoogleCalendarEvent(event());
-  server.failOnce((call) => call.method === "DELETE" ? new Error("Network lost") : null);
-  await assert.rejects(firstClient.deleteGoogleCalendarEvent(event()), /Network lost/);
+  server.failTimes((call) => call.method === "DELETE" ? new Error("Network lost") : null);
+  await assert.rejects(firstClient.deleteGoogleCalendarEvent(event()), /could not be reached/i);
   assert.equal(server.events.size, 1);
   const reloadedClient = loadClient(window, server.fetch);
   assert.equal(await reloadedClient.retryGoogleCalendarDeletions(userId, []), 1);
@@ -640,8 +781,8 @@ test("deletion is queued even if the lookup failed before obtaining a Google eve
   const firstClient = loadClient(window, server.fetch);
   await firstClient.syncGoogleCalendarEvent(event());
   window.localStorage.removeItem(linksKey);
-  server.failOnce(() => new Error("Offline"));
-  await assert.rejects(firstClient.deleteGoogleCalendarEvent(event()), /Offline/);
+  server.failTimes(() => new Error("Offline"));
+  await assert.rejects(firstClient.deleteGoogleCalendarEvent(event()), /could not be reached/i);
   const reloadedClient = loadClient(window, server.fetch);
   assert.equal(await reloadedClient.retryGoogleCalendarDeletions(userId, []), 1);
   assert.equal(server.events.size, 0);
@@ -720,6 +861,7 @@ function bulkSync({ rows = [eventRow()], exceptions = [], exceptionsError = null
     googleCalendarDeletionCandidates: (uid) => { calls.push({ action: "candidates", uid }); return ["removed"]; },
     googleCalendarRemoteDeletionCandidates: async (uid) => { calls.push({ action: "remoteCandidates", uid }); return []; },
     syncGoogleCalendarEvent: async (value) => { calls.push({ action: "event", value }); return syncResult; },
+    loadGoogleCalendarOverrides: async () => [],
     reconcileGoogleCalendarOccurrences: async (value, changes) => { calls.push({ action: "reconcile", value, changes }); },
     syncGoogleCalendarOccurrence: async (value, originalStartsAt, change) => { calls.push({ action: "occurrence", value, originalStartsAt, change }); return syncResult; },
     retryGoogleCalendarDeletions: async (uid, ids, candidates) => { calls.push({ action: "delete", uid, ids, candidates }); return 2; },
